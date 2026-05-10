@@ -22,12 +22,15 @@ from shared.db import init_db, MomentumTrade
 from shared.notifier import Notifier
 from analyst.fetcher import BybitFetcher
 from momentum.signal import generate_momentum_signal
+from momentum.ws_watcher import run_price_watcher
+from shared.tg_commands import run_command_bot
 
 # ── open position state ───────────────────────────────────────────────────────
 
 _open_trade: MomentumTrade | None = None
 _open_trade_id: int | None = None
 _hold_bars: int = 0
+_last_ws_price: float = 0.0
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -40,38 +43,17 @@ def _seconds_to_next_5m() -> float:
     return max(1.0, next_close - now)
 
 
-def _check_open_position(engine, fetcher: BybitFetcher, cfg, notifier: Notifier) -> bool:
-    """Check SL/TP/timeout on open paper position. Returns True if still open."""
+def _do_close_position(engine, exit_price: float, outcome: str, notifier: Notifier) -> None:
+    """Write close to DB and notify. Caller must hold no lock."""
     global _open_trade, _open_trade_id, _hold_bars
 
     if _open_trade is None:
-        return False
+        return
 
-    try:
-        data = fetcher.get_funding_rate(cfg.symbol)
-        price = data["mark_price"]
-    except Exception as e:
-        logger.warning(f"Price fetch failed: {e}")
-        return True
-
-    _hold_bars += 1
     direction = _open_trade.direction
-    sl = _open_trade.sl_price
-    tp = _open_trade.tp_price
     entry = _open_trade.entry_price
-
-    hit_tp = (direction == "long" and price >= tp) or (direction == "short" and price <= tp)
-    hit_sl = (direction == "long" and price <= sl) or (direction == "short" and price >= sl)
-    timeout = _hold_bars >= cfg.momentum_max_hold_bars
-
-    if not (hit_tp or hit_sl or timeout):
-        return True
-
-    exit_price = tp if hit_tp else (sl if hit_sl else price)
     raw_pnl = (exit_price - entry) / entry * (1 if direction == "long" else -1)
     net_pnl = raw_pnl - 0.0002 - 0.00055  # maker entry + taker exit
-
-    outcome = "tp" if hit_tp else ("sl" if hit_sl else "timeout")
     emoji = "✅" if net_pnl > 0 else "❌"
 
     with Session(engine) as session:
@@ -89,7 +71,7 @@ def _check_open_position(engine, fetcher: BybitFetcher, cfg, notifier: Notifier)
     )
     notifier.send(
         f"{emoji} Momentum CLOSE [{outcome.upper()}]\n"
-        f"{direction.upper()} {cfg.symbol}\n"
+        f"{direction.upper()} {_open_trade.symbol}\n"
         f"Entry: {entry:.2f} → Exit: {exit_price:.2f}\n"
         f"PnL: {net_pnl:+.3%} (paper)"
     )
@@ -97,7 +79,56 @@ def _check_open_position(engine, fetcher: BybitFetcher, cfg, notifier: Notifier)
     _open_trade = None
     _open_trade_id = None
     _hold_bars = 0
-    return False
+
+
+def _restore_open_position(engine) -> None:
+    """On startup, restore any open paper position from DB."""
+    global _open_trade, _open_trade_id, _hold_bars
+    from sqlalchemy import select
+    with Session(engine) as session:
+        trade = session.execute(
+            select(MomentumTrade)
+            .where(MomentumTrade.outcome == "open", MomentumTrade.paper == True)
+            .order_by(MomentumTrade.opened_at.desc())
+        ).scalars().first()
+
+        if trade is None:
+            return
+
+        opened_at = trade.opened_at
+        if opened_at.tzinfo is None:
+            opened_at = opened_at.replace(tzinfo=timezone.utc)
+        elapsed = (datetime.now(timezone.utc) - opened_at).total_seconds()
+        bars_elapsed = max(0, int(elapsed / 300))
+
+        _open_trade_id = trade.id
+        _open_trade = trade
+        _hold_bars = bars_elapsed
+
+    logger.info(
+        f"[MOMENTUM] Restored open {_open_trade.direction.upper()} "
+        f"entry={_open_trade.entry_price:.2f} sl={_open_trade.sl_price:.2f} "
+        f"tp={_open_trade.tp_price:.2f} bars_elapsed={bars_elapsed}"
+    )
+
+
+def _check_open_position(engine, cfg, notifier: Notifier) -> bool:
+    """Check timeout on open paper position. Returns True if still open.
+
+    SL/TP are handled in real-time by the WebSocket watcher.
+    """
+    global _hold_bars
+
+    if _open_trade is None:
+        return False
+
+    _hold_bars += 1
+    if _hold_bars >= cfg.momentum_max_hold_bars:
+        exit_price = _last_ws_price if _last_ws_price > 0 else _open_trade.entry_price
+        _do_close_position(engine, exit_price, "timeout", notifier)
+        return False
+
+    return True
 
 
 def _open_position(engine, signal, cfg, notifier: Notifier) -> None:
@@ -161,16 +192,20 @@ async def _main_loop(engine, fetcher: BybitFetcher, cfg, notifier: Notifier) -> 
         await asyncio.sleep(wait)
 
         try:
-            # Check/close existing position first
-            still_open = _check_open_position(engine, fetcher, cfg, notifier)
+            # Check timeout on open position (SL/TP handled by WebSocket)
+            still_open = _check_open_position(engine, cfg, notifier)
             if still_open:
                 continue
 
-            # Fetch data
+            # Fetch data — 0.5s between calls to avoid anonymous rate limit
             eth_5m  = fetcher.get_ohlcv(cfg.symbol, "5m", 60)
+            await asyncio.sleep(0.5)
             btc_5m  = fetcher.get_ohlcv("BTCUSDT",  "5m", 60)
-            eth_oi  = fetcher.get_oi_history(cfg.symbol, "5min", 50)
+            await asyncio.sleep(0.5)
+            eth_oi  = fetcher.get_oi_history(cfg.symbol, "1h", 50)
+            await asyncio.sleep(0.5)
             _ohlcv_1h = fetcher.get_ohlcv(cfg.symbol, "1h", 50) or _ohlcv_1h
+            await asyncio.sleep(0.5)
 
             # Existing funding position direction (for mutex)
             fund_data = fetcher.get_funding_rate(cfg.symbol)
@@ -204,9 +239,9 @@ async def _main_loop(engine, fetcher: BybitFetcher, cfg, notifier: Notifier) -> 
 
 # ── stats helper ──────────────────────────────────────────────────────────────
 
-def print_paper_stats(engine) -> None:
+def _build_stats_message(engine) -> str:
+    from sqlalchemy import select
     with Session(engine) as session:
-        from sqlalchemy import select
         trades = session.execute(
             select(MomentumTrade).where(
                 MomentumTrade.paper == True,
@@ -215,16 +250,39 @@ def print_paper_stats(engine) -> None:
         ).scalars().all()
 
     if not trades:
-        print("No closed momentum trades yet.")
-        return
+        return "📊 Momentum: no closed trades yet."
 
     pnls = [t.pnl_pct for t in trades if t.pnl_pct is not None]
     wins = sum(1 for p in pnls if p > 0)
     wr = wins / len(pnls) if pnls else 0
     total = sum(pnls)
-    print(f"\n=== Momentum Paper Stats ===")
-    print(f"Trades: {len(pnls)} | WR: {wr:.1%} | Total: {total:+.2%}")
-    print(f"Breakeven WR: 53.5% | {'✅ PASSING' if wr >= 0.535 else '❌ NOT YET'}")
+    status = "✅ PASSING" if wr >= 0.535 else "❌ NOT YET"
+    pos = f"📍 Open: {_open_trade.direction.upper()} entry={_open_trade.entry_price:.2f}" \
+        if _open_trade else "📍 No open position"
+    return (
+        f"📊 Momentum Daily Report\n"
+        f"Trades: {len(pnls)} | WR: {wr:.1%} | Total PnL: {total:+.2%}\n"
+        f"Target WR: 53.5% → {status}\n"
+        f"{pos}"
+    )
+
+
+def print_paper_stats(engine) -> None:
+    print(_build_stats_message(engine))
+
+
+async def _daily_report_loop(engine, notifier: Notifier) -> None:
+    """Send stats to Telegram once a day at 00:05 UTC."""
+    while True:
+        now = datetime.now(timezone.utc)
+        next_report = now.replace(hour=0, minute=5, second=0, microsecond=0)
+        if next_report <= now:
+            next_report += timedelta(days=1)
+        await asyncio.sleep((next_report - now).total_seconds())
+        try:
+            notifier.send(_build_stats_message(engine))
+        except Exception as e:
+            logger.error(f"[MOMENTUM] Daily report error: {e}")
 
 
 # ── entry point ───────────────────────────────────────────────────────────────
@@ -243,15 +301,61 @@ def main() -> None:
     fetcher = BybitFetcher(cfg.bybit_api_key, cfg.bybit_api_secret, cfg.bybit_testnet)
     notifier = Notifier(cfg.telegram_token, cfg.telegram_chat_id)
 
+    _restore_open_position(engine)
+
     logger.info("MOMENTUM started (paper mode, 5m, breakeven WR=53.5%)")
     notifier.send(
-        "⚡ Momentum Strategy started (PAPER MODE)\n"
-        "5m EMA cross + OI delta + VWAP\n"
-        "SL=0.35% | TP=0.70% | Breakeven WR=53.5%\n"
-        "Will enable live after 2 weeks + WR≥53.5%"
+        "⚡ Momentum started (PAPER MODE)\n"
+        f"VWAP reversion 5m | ADX<35 filter\n"
+        f"SL={cfg.momentum_sl_pct:.2%} | TP={cfg.momentum_tp_pct:.2%} | Breakeven WR=53.5%\n"
+        "Live after 2 weeks + WR>=53.5%"
     )
 
-    asyncio.run(_main_loop(engine, fetcher, cfg, notifier))
+    async def _on_ws_price(price: float) -> None:
+        """Called on every WebSocket tick — check SL/TP in real-time."""
+        global _last_ws_price
+        _last_ws_price = price
+        if _open_trade is None:
+            return
+        direction = _open_trade.direction
+        sl = _open_trade.sl_price
+        tp = _open_trade.tp_price
+        hit_tp = (direction == "long" and price >= tp) or (direction == "short" and price <= tp)
+        hit_sl = (direction == "long" and price <= sl) or (direction == "short" and price >= sl)
+        if hit_tp:
+            _do_close_position(engine, tp, "tp", notifier)
+        elif hit_sl:
+            _do_close_position(engine, sl, "sl", notifier)
+
+    def _get_status() -> str:
+        if _open_trade is None:
+            price = f"{_last_ws_price:.2f}" if _last_ws_price else "?"
+            return f"📍 No open position\nLast price: {price}"
+        pct_from_entry = (_last_ws_price - _open_trade.entry_price) / _open_trade.entry_price
+        if _open_trade.direction == "short":
+            pct_from_entry = -pct_from_entry
+        return (
+            f"📍 OPEN {_open_trade.direction.upper()} {cfg.symbol}\n"
+            f"Entry: {_open_trade.entry_price:.2f}\n"
+            f"SL: {_open_trade.sl_price:.2f} | TP: {_open_trade.tp_price:.2f}\n"
+            f"Now: {_last_ws_price:.2f} ({pct_from_entry:+.2%})\n"
+            f"Bars held: {_hold_bars}/{cfg.momentum_max_hold_bars}"
+        )
+
+    async def _run() -> None:
+        await asyncio.gather(
+            _main_loop(engine, fetcher, cfg, notifier),
+            run_price_watcher(cfg.symbol, _on_ws_price),
+            _daily_report_loop(engine, notifier),
+            run_command_bot(
+                cfg.telegram_token,
+                int(cfg.telegram_chat_id),
+                _get_status,
+                lambda: _build_stats_message(engine),
+            ),
+        )
+
+    asyncio.run(_run())
 
 
 if __name__ == "__main__":

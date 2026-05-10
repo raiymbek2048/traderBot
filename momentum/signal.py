@@ -104,9 +104,9 @@ def compute_oi_delta_pct(oi_history: list[dict], lookback: int = 12) -> float:
 def classify_regime(ohlcv_1h: list[dict]) -> tuple[Regime, float, float]:
     adx = compute_adx(ohlcv_1h, 14)
     atr = compute_atr(ohlcv_1h, 14)
-    if adx > 25:
+    if adx > 35:
         return "trending", adx, atr
-    elif adx < 20:
+    elif adx < 25:
         return "ranging", adx, atr
     else:
         return "transition", adx, atr
@@ -219,16 +219,11 @@ def generate_momentum_signal(
     size_mult = regime_size_multiplier(regime)
     mark_price = eth_5m[-1]["close"]
 
-    # ETH branch: VWAP reversion (works in ranging + transition, skip strong trends)
+    # ETH branch: VWAP reversion (skip only strong trends ADX>35)
     direction = None
     branch = "eth"
     if regime != "trending":
         direction = _eth_branch(eth_5m, deviation_threshold=vwap_threshold)
-
-    # BTC branch: lead-lag (works in trending + transition)
-    if direction is None and btc_5m and regime != "ranging":
-        direction = _btc_branch(btc_5m, eth_5m, btc_threshold)
-        branch = "btc"
 
     if direction is None:
         return None

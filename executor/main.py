@@ -1,7 +1,7 @@
 """EXECUTOR — читает сигналы из БД и открывает/закрывает позиции (paper или live)."""
 from __future__ import annotations
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from loguru import logger
 from sqlalchemy.orm import Session
 from sqlalchemy import select
@@ -32,10 +32,12 @@ def process_new_signals(cfg, engine, pm: PositionManager, notifier: Notifier) ->
             .where(Trade.paper == cfg.paper_trading)
         )
 
+        max_signal_age = datetime.utcnow() - timedelta(hours=2)
         signals = session.scalars(
             select(SignalRow)
             .where(SignalRow.acted_on == False)
             .where(SignalRow.confidence >= 0.60)
+            .where(SignalRow.created_at >= max_signal_age)
             .order_by(SignalRow.created_at.asc())
         ).all()
 
@@ -109,6 +111,20 @@ def main():
     engine = init_db(cfg.database_url)
     notifier = Notifier(cfg.telegram_token, cfg.telegram_chat_id)
     pm = PositionManager(cfg)
+
+    # Mark all stale unprocessed signals as acted_on to avoid acting on old data
+    with Session(engine) as session:
+        stale_cutoff = datetime.utcnow() - timedelta(hours=2)
+        stale = session.scalars(
+            select(SignalRow)
+            .where(SignalRow.acted_on == False)
+            .where(SignalRow.created_at < stale_cutoff)
+        ).all()
+        for s in stale:
+            s.acted_on = True
+        if stale:
+            logger.info(f"Marked {len(stale)} stale signals as acted_on on startup")
+        session.commit()
 
     logger.info(f"EXECUTOR started | paper={cfg.paper_trading}")
     notifier.send(f"🤖 TraderBot EXECUTOR started | paper={cfg.paper_trading}")
