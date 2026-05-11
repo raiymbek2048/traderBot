@@ -17,7 +17,7 @@ from executor.position import PositionManager
 
 
 def process_new_signals(cfg, engine, pm: PositionManager, notifier: Notifier) -> None:
-    with Session(engine) as session:
+    with Session(engine, expire_on_commit=False) as session:
         # Синхронизируем состояние позиции с БД (защита от рестарта)
         if not pm.has_open_position():
             db_trade = pm.get_open_trade_from_db(engine)
@@ -70,7 +70,7 @@ def process_new_signals(cfg, engine, pm: PositionManager, notifier: Notifier) ->
 
 
 def check_open_positions(cfg, engine, pm: PositionManager, notifier: Notifier) -> None:
-    with Session(engine) as session:
+    with Session(engine, expire_on_commit=False) as session:
         open_trades = session.scalars(
             select(Trade).where(Trade.status == "open").where(Trade.paper == cfg.paper_trading)
         ).all()

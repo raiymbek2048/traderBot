@@ -89,7 +89,7 @@ class PositionManager:
 
     def get_open_trade_from_db(self, engine) -> "Trade | None":
         """Синхронизирует _open_trade с БД при перезапуске."""
-        from sqlalchemy.orm import Session
+        from sqlalchemy.orm import Session, make_transient
         from sqlalchemy import select
         with Session(engine) as session:
             trade = session.scalars(
@@ -99,6 +99,7 @@ class PositionManager:
             ).first()
             if trade:
                 session.expunge(trade)
+                make_transient(trade)  # отвязываем от SQLAlchemy, атрибуты остаются
             return trade
 
     def check_exit(self, trade: Trade, current_price: float) -> dict | None:
