@@ -7,6 +7,8 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select, func
 
 import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from shared.utils import utcnow
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import ccxt
@@ -100,7 +102,7 @@ def run_check(cfg, engine, notifier: Notifier, terminal_stop_triggered: list) ->
         )
 
         # Heartbeat каждые 6 часов
-        now = datetime.now(timezone.utc)
+        now = utcnow()
         if not hasattr(run_check, "_last_heartbeat") or \
                 (now - run_check._last_heartbeat) > timedelta(hours=6):
             notifier.send(

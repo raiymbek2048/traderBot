@@ -128,7 +128,7 @@ class BybitFetcher:
                 abs(l.get("cost") or 0)
                 for l in liq
                 if l.get("timestamp") and
-                   (datetime.now(timezone.utc).timestamp() * 1000 - l["timestamp"]) < 3_600_000
+                   (utcnow().timestamp() * 1000 - l["timestamp"]) < 3_600_000
             )
             return total
         except Exception:

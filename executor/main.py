@@ -7,6 +7,8 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select
 
 import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from shared.utils import utcnow
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from sqlalchemy import func
@@ -32,7 +34,7 @@ def process_new_signals(cfg, engine, pm: PositionManager, notifier: Notifier) ->
             .where(Trade.paper == cfg.paper_trading)
         )
 
-        max_signal_age = datetime.now(timezone.utc) - timedelta(hours=2)
+        max_signal_age = utcnow() - timedelta(hours=2)
         signals = session.scalars(
             select(SignalRow)
             .where(SignalRow.acted_on == False)
@@ -83,7 +85,7 @@ def check_open_positions(cfg, engine, pm: PositionManager, notifier: Notifier) -
             result = pm.check_exit(trade, current_price)
             if result:
                 trade.exit_price = result.get("exit_price", current_price)
-                trade.closed_at = datetime.now(timezone.utc)
+                trade.closed_at = utcnow()
                 trade.status = result["status"]
                 trade.pnl = result["pnl"]
                 trade.pnl_pct = result["pnl_pct"]
@@ -114,7 +116,7 @@ def main():
 
     # Mark all stale unprocessed signals as acted_on to avoid acting on old data
     with Session(engine) as session:
-        stale_cutoff = datetime.now(timezone.utc) - timedelta(hours=2)
+        stale_cutoff = utcnow() - timedelta(hours=2)
         stale = session.scalars(
             select(SignalRow)
             .where(SignalRow.acted_on == False)

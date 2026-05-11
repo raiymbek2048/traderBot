@@ -51,7 +51,7 @@ async def refresh_binance_funding(symbol: str) -> None:
 
 def _update_price_history(price: float) -> None:
     global _price_15m_ago, _last_price_update
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     if _last_price_update is None or (now - _last_price_update).total_seconds() >= 900:
         _price_15m_ago = price
         _last_price_update = now
@@ -59,7 +59,7 @@ def _update_price_history(price: float) -> None:
 
 async def evaluate_signals(engine, fetcher: BybitFetcher, cfg, notifier: Notifier) -> None:
     """Find signals created in last 30 min without a gate decision → evaluate."""
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=30)
+    cutoff = utcnow() - timedelta(minutes=30)
 
     with Session(engine) as session:
         # signals not yet evaluated by gate

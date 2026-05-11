@@ -1,11 +1,12 @@
 """Управление позицией: расчёт размера, SL/TP, проверка выхода."""
 from __future__ import annotations
-from datetime import datetime, timezone
 import ccxt
 from loguru import logger
 
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
+from shared.utils import utcnow
 
 from shared.config import Config
 from shared.db import Trade
@@ -116,7 +117,7 @@ class PositionManager:
         # Максимальное время удержания: 24 часа
         max_hold_exceeded = (
             trade.opened_at is not None and
-            (datetime.now(timezone.utc) - trade.opened_at).total_seconds() > 86400
+            (utcnow() - trade.opened_at).total_seconds() > 86400
         )
 
         if not hit_sl and not hit_tp and not max_hold_exceeded:
