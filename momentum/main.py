@@ -291,7 +291,8 @@ def main() -> None:
     cfg = load_config()
     logger.remove()
     logger.add(sys.stderr, level=cfg.log_level)
-    logger.add("logs/momentum.log", rotation="10 MB", retention="30 days")
+    symbol_tag = cfg.symbol.lower().replace("usdt", "")
+    logger.add(f"logs/momentum_{symbol_tag}.log", rotation="10 MB", retention="30 days")
 
     if not cfg.momentum_enabled:
         logger.info("MOMENTUM disabled via config")

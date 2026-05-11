@@ -94,6 +94,19 @@ class GateDecision(Base):
     outcome_win = Column(Boolean)
 
 
+class SpreadEvent(Base):
+    __tablename__ = "spread_events"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    symbol = Column(String(20), nullable=False)
+    buy_exchange = Column(String(20), nullable=False)
+    sell_exchange = Column(String(20), nullable=False)
+    buy_price = Column(Float, nullable=False)
+    sell_price = Column(Float, nullable=False)
+    spread_pct = Column(Float, nullable=False)   # gross %
+    net_pct = Column(Float, nullable=False)       # after fees %
+    ts = Column(DateTime, nullable=False)
+
+
 def get_engine(database_url: str):
     return create_engine(database_url, echo=False)
 
