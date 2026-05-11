@@ -10,7 +10,6 @@ import asyncio
 import json
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
 
 import websockets
 from loguru import logger
@@ -21,6 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from shared.db import init_db, SpreadEvent
 from shared.config import load_config
+from shared.utils import utcnow
 
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 MIN_SPREAD_PCT = 0.003   # 0.30% — log threshold
@@ -148,7 +148,7 @@ async def _check_spread(sym: str, engine) -> None:
         sell_price=y.bid if sell_ex == "bybit" else b.bid,
         spread_pct=round(gross * 100, 4),
         net_pct=round(net * 100, 4),
-        ts=datetime.now(timezone.utc),
+        ts=utcnow(),
     )
 
     with Session(engine) as session:
