@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import os
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timezone, timedelta
 
 from loguru import logger
 from sqlalchemy.orm import Session
@@ -59,7 +59,7 @@ def _update_price_history(price: float) -> None:
 
 async def evaluate_signals(engine, fetcher: BybitFetcher, cfg, notifier: Notifier) -> None:
     """Find signals created in last 30 min without a gate decision → evaluate."""
-    cutoff = datetime.utcnow() - timedelta(minutes=30)
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=30)
 
     with Session(engine) as session:
         # signals not yet evaluated by gate

@@ -1,6 +1,6 @@
 """Получение funding rate, OHLCV, OI с Bybit."""
 from __future__ import annotations
-from datetime import datetime
+from datetime import datetime, timezone, timezone
 import ccxt
 import httpx
 from loguru import logger
@@ -128,7 +128,7 @@ class BybitFetcher:
                 abs(l.get("cost") or 0)
                 for l in liq
                 if l.get("timestamp") and
-                   (datetime.utcnow().timestamp() * 1000 - l["timestamp"]) < 3_600_000
+                   (datetime.now(timezone.utc).timestamp() * 1000 - l["timestamp"]) < 3_600_000
             )
             return total
         except Exception:

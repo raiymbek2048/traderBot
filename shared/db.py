@@ -1,5 +1,5 @@
 from __future__ import annotations
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy import create_engine, Column, Integer, Float, String, DateTime, Boolean, Text
 from sqlalchemy.orm import DeclarativeBase, Session
 from sqlalchemy import select
@@ -16,7 +16,7 @@ class FundingRate(Base):
     funding_rate = Column(Float, nullable=False)
     funding_time = Column(DateTime, nullable=False, unique=True)
     mark_price = Column(Float)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
 class Signal(Base):
@@ -27,7 +27,7 @@ class Signal(Base):
     funding_rate = Column(Float, nullable=False)
     mark_price = Column(Float, nullable=False)
     confidence = Column(Float)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     acted_on = Column(Boolean, default=False)
 
 
@@ -46,7 +46,7 @@ class Trade(Base):
     status = Column(String(20), default="open")  # open / closed / stopped
     paper = Column(Boolean, default=True)
     signal_id = Column(Integer)
-    opened_at = Column(DateTime, default=datetime.utcnow)
+    opened_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     closed_at = Column(DateTime)
     notes = Column(Text)
 
@@ -66,7 +66,7 @@ class MomentumTrade(Base):
     pnl_pct = Column(Float)
     outcome = Column(String(10))         # tp / sl / timeout / open
     paper = Column(Boolean, default=True)
-    opened_at = Column(DateTime, default=datetime.utcnow)
+    opened_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     closed_at = Column(DateTime)
     reason = Column(Text)
 
@@ -88,7 +88,7 @@ class GateDecision(Base):
     binance_funding = Column(Float)
     bybit_funding = Column(Float)
     funding_spread = Column(Float)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     # filled by analysis script after trade closes
     outcome_pnl = Column(Float)
     outcome_win = Column(Boolean)

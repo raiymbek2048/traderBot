@@ -1,7 +1,7 @@
 """RISK_MANAGER — мониторит капитал, circuit breaker, heartbeat."""
 from __future__ import annotations
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from loguru import logger
 from sqlalchemy.orm import Session
 from sqlalchemy import select, func
@@ -100,7 +100,7 @@ def run_check(cfg, engine, notifier: Notifier, terminal_stop_triggered: list) ->
         )
 
         # Heartbeat каждые 6 часов
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         if not hasattr(run_check, "_last_heartbeat") or \
                 (now - run_check._last_heartbeat) > timedelta(hours=6):
             notifier.send(
