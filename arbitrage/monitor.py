@@ -42,6 +42,8 @@ class BookTop:
 # ── shared state ──────────────────────────────────────────────────────────────
 
 books: dict[str, BookTop] = {}  # key: "binance:BTCUSDT" / "bybit:BTCUSDT"
+_last_saved: dict[str, float] = {}  # symbol → unix ts последней записи в БД
+SAVE_COOLDOWN = 1.0  # секунд между записями одного символа
 
 
 def compute_spread(sym: str) -> tuple[float, float] | None:
@@ -134,6 +136,12 @@ async def _check_spread(sym: str, engine) -> None:
     gross, net = result
     if gross < MIN_SPREAD_PCT:
         return
+
+    # кулдаун — не писать дубли чаще раза в секунду
+    now = time.time()
+    if now - _last_saved.get(sym, 0) < SAVE_COOLDOWN:
+        return
+    _last_saved[sym] = now
 
     b = books.get(f"binance:{sym}")
     y = books.get(f"bybit:{sym}")
