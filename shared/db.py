@@ -101,10 +101,16 @@ class SpreadEvent(Base):
     symbol = Column(String(20), nullable=False)
     buy_exchange = Column(String(20), nullable=False)
     sell_exchange = Column(String(20), nullable=False)
-    buy_price = Column(Float, nullable=False)
-    sell_price = Column(Float, nullable=False)
-    spread_pct = Column(Float, nullable=False)   # gross %
-    net_pct = Column(Float, nullable=False)       # after fees %
+    buy_price = Column(Float, nullable=False)     # ask цена на бирже покупки
+    sell_price = Column(Float, nullable=False)    # bid цена на бирже продажи
+    spread_pct = Column(Float, nullable=False)    # gross %
+    net_pct = Column(Float, nullable=False)       # после комиссий %
+    # полные book tops — нужны для симуляции исполнения в Phase 1
+    binance_bid = Column(Float)
+    binance_ask = Column(Float)
+    bybit_bid = Column(Float)
+    bybit_ask = Column(Float)
+    book_age_ms = Column(Integer)                 # макс. возраст данных в мс (staleness)
     ts = Column(DateTime, nullable=False)
 
 
