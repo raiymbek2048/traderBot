@@ -110,7 +110,11 @@ async def binance_listener(engine) -> None:
             async with websockets.connect(url, ping_interval=None) as ws:
                 logger.info("Binance WS connected")
                 backoff = 2
-                async for raw in ws:
+                while True:
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=WS_SILENCE_SEC)
+                    except asyncio.TimeoutError:
+                        raise RuntimeError(f"Binance WS silent for {WS_SILENCE_SEC}s — forcing reconnect")
                     _last_rx["binance"] = time.time()
                     msg = json.loads(raw)
                     data = msg.get("data", msg)
@@ -175,7 +179,11 @@ async def bybit_listener(engine) -> None:
                 _bybit_ob.clear()
                 sub = {"op": "subscribe", "args": [f"orderbook.1.{s}" for s in SYMBOLS]}
                 await ws.send(json.dumps(sub))
-                async for raw in ws:
+                while True:
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=WS_SILENCE_SEC)
+                    except asyncio.TimeoutError:
+                        raise RuntimeError(f"Bybit WS silent for {WS_SILENCE_SEC}s — forcing reconnect")
                     _last_rx["bybit"] = time.time()
                     msg = json.loads(raw)
                     topic = msg.get("topic", "")
