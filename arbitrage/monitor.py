@@ -107,7 +107,7 @@ async def binance_listener(engine) -> None:
     backoff = 2
     while True:
         try:
-            async with websockets.connect(url, ping_interval=20) as ws:
+            async with websockets.connect(url, ping_interval=None) as ws:
                 logger.info("Binance WS connected")
                 backoff = 2
                 async for raw in ws:
@@ -169,7 +169,7 @@ async def bybit_listener(engine) -> None:
     backoff = 2
     while True:
         try:
-            async with websockets.connect(BYBIT_WS, ping_interval=20) as ws:
+            async with websockets.connect(BYBIT_WS, ping_interval=None) as ws:
                 logger.info("Bybit WS connected")
                 backoff = 2
                 _bybit_ob.clear()
