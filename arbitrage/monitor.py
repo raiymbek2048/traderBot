@@ -1,7 +1,9 @@
-"""Arbitrage Phase 0 — spread monitoring only, zero capital risk.
+"""SpreadArb — Phase 1: мониторинг + бумажная симуляция.
 
-Connects to Binance + Bybit WebSocket simultaneously, logs every spread
-≥ MIN_SPREAD_PCT to DB. No orders are placed.
+Подключается к Binance + Bybit WebSocket, при спреде ≥ ALERT_SPREAD_PCT:
+  - записывает SpreadEvent в БД
+  - создаёт ArbPaperTrade (бумажная сделка)
+  - отправляет Telegram алерт с PnL и дневной статистикой
 
 Run: python -m arbitrage.monitor
 """
@@ -9,28 +11,35 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from dataclasses import dataclass, field
+import urllib.request
+import urllib.parse
+from dataclasses import dataclass
 
 import websockets
 from loguru import logger
 from sqlalchemy.orm import Session
+from sqlalchemy import func, select
 
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from shared.db import init_db, SpreadEvent
+from shared.db import init_db, SpreadEvent, ArbPaperTrade
 from shared.config import load_config
 from shared.utils import utcnow
 
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-MIN_SPREAD_PCT  = 0.003   # 0.30% — log threshold
-ALERT_SPREAD_PCT = 0.004  # 0.40% — potential trade threshold
-MAX_BOOK_AGE_MS = 5000    # данные старше 5 сек считаем stale — не сравниваем
-SAVE_COOLDOWN   = 1.0     # секунд между записями одного символа
-WS_SILENCE_SEC  = 30      # если нет обновлений дольше — переподключаемся
+MIN_SPREAD_PCT   = 0.003   # 0.30% — log threshold
+ALERT_SPREAD_PCT = 0.004   # 0.40% — paper trade threshold
+MAX_BOOK_AGE_MS  = 5000    # данные старше 5 сек считаем stale
+SAVE_COOLDOWN    = 1.0     # секунд между записями одного символа
+WS_SILENCE_SEC   = 30      # если нет обновлений дольше — переподключаемся
+PAPER_SIZE_USDT  = 1000.0  # размер бумажной позиции в USDT
 
 BINANCE_WS = "wss://stream.binance.com:9443/stream?streams="
 BYBIT_WS   = "wss://stream.bybit.com/v5/public/linear"
+
+_tg_token: str = ""
+_tg_chat:  str = ""
 
 
 @dataclass
@@ -212,6 +221,25 @@ async def bybit_listener(engine) -> None:
             backoff = min(backoff * 2, 60)
 
 
+# ── telegram ───────────────────────────────────────────────────────────────────
+
+async def _tg_send(text: str) -> None:
+    if not _tg_token or not _tg_chat:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{_tg_token}/sendMessage"
+        data = urllib.parse.urlencode({
+            "chat_id": _tg_chat,
+            "text": text,
+            "parse_mode": "HTML",
+        }).encode()
+        await asyncio.get_event_loop().run_in_executor(
+            None, lambda: urllib.request.urlopen(url, data, timeout=5)
+        )
+    except Exception as e:
+        logger.warning(f"Telegram send failed: {e}")
+
+
 # ── spread checker ─────────────────────────────────────────────────────────────
 
 async def _check_spread(sym: str, engine) -> None:
@@ -226,15 +254,19 @@ async def _check_spread(sym: str, engine) -> None:
 
     gross = result["gross"]
     net   = result["net"]
+    gross_pct = round(gross * 100, 4)
+    net_pct   = round(net * 100, 4)
+    buy_price  = result["binance_ask"] if result["buy_ex"] == "binance" else result["bybit_ask"]
+    sell_price = result["bybit_bid"]   if result["sell_ex"] == "bybit"  else result["binance_bid"]
 
     event = SpreadEvent(
         symbol=sym,
         buy_exchange=result["buy_ex"],
         sell_exchange=result["sell_ex"],
-        buy_price=result["binance_ask"] if result["buy_ex"] == "binance" else result["bybit_ask"],
-        sell_price=result["bybit_bid"] if result["sell_ex"] == "bybit" else result["binance_bid"],
-        spread_pct=round(gross * 100, 4),
-        net_pct=round(net * 100, 4),
+        buy_price=buy_price,
+        sell_price=sell_price,
+        spread_pct=gross_pct,
+        net_pct=net_pct,
         binance_bid=result["binance_bid"],
         binance_ask=result["binance_ask"],
         bybit_bid=result["bybit_bid"],
@@ -249,10 +281,54 @@ async def _check_spread(sym: str, engine) -> None:
 
     level = "🚨 ALERT" if gross >= ALERT_SPREAD_PCT else "📊"
     logger.info(
-        f"{level} {sym} spread={gross*100:.3f}% net={net*100:.3f}% "
+        f"{level} {sym} spread={gross_pct:.3f}% net={net_pct:.3f}% "
         f"buy@{result['buy_ex']} sell@{result['sell_ex']} "
         f"age={result['book_age_ms']}ms"
     )
+
+    if gross < ALERT_SPREAD_PCT:
+        return
+
+    pnl_usdt = round(PAPER_SIZE_USDT * net / 1, 4)
+
+    paper = ArbPaperTrade(
+        symbol=sym,
+        buy_exchange=result["buy_ex"],
+        sell_exchange=result["sell_ex"],
+        buy_price=buy_price,
+        sell_price=sell_price,
+        size_usdt=PAPER_SIZE_USDT,
+        gross_pct=gross_pct,
+        net_pct=net_pct,
+        pnl_usdt=pnl_usdt,
+        book_age_ms=result["book_age_ms"],
+        ts=utcnow(),
+    )
+
+    with Session(engine) as session:
+        session.add(paper)
+        session.commit()
+
+        today_start = utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        day_trades = session.scalar(
+            select(func.count(ArbPaperTrade.id))
+            .where(ArbPaperTrade.ts >= today_start)
+        ) or 0
+        day_pnl = session.scalar(
+            select(func.sum(ArbPaperTrade.pnl_usdt))
+            .where(ArbPaperTrade.ts >= today_start)
+        ) or 0.0
+
+    msg = (
+        f"💱 <b>SpreadArb PAPER TRADE</b>\n"
+        f"<b>{sym}</b>: buy@{result['buy_ex'].upper()} → sell@{result['sell_ex'].upper()}\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"Gross: <b>{gross_pct:.3f}%</b>  |  Net: <b>{net_pct:.3f}%</b>\n"
+        f"Size: ${PAPER_SIZE_USDT:,.0f}  |  PnL: <b>+${pnl_usdt:.2f}</b>\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"📊 Сегодня: {day_trades} сделок  |  +${day_pnl:.2f} USDT"
+    )
+    await _tg_send(msg)
 
 
 # ── watchdog ───────────────────────────────────────────────────────────────────
@@ -308,13 +384,18 @@ async def stats_printer(engine) -> None:
 # ── entrypoint ─────────────────────────────────────────────────────────────────
 
 async def main() -> None:
+    global _tg_token, _tg_chat
     cfg = load_config()
+    _tg_token = cfg.telegram_token
+    _tg_chat  = cfg.telegram_chat_id
+
     logger.remove()
     logger.add(sys.stderr, level="INFO")
     logger.add("logs/arbitrage_monitor.log", rotation="50 MB", retention="90 days")
 
     engine = init_db(cfg.database_url)
-    logger.info(f"Arbitrage monitor started | symbols={SYMBOLS} | threshold={MIN_SPREAD_PCT*100:.2f}% | max_book_age={MAX_BOOK_AGE_MS}ms")
+    logger.info(f"SpreadArb monitor started | symbols={SYMBOLS} | paper_size=${PAPER_SIZE_USDT:.0f} | alert≥{ALERT_SPREAD_PCT*100:.2f}% | max_book_age={MAX_BOOK_AGE_MS}ms")
+    await _tg_send("🚀 <b>SpreadArb запущен</b>\nМониторю Binance↔Bybit | алерт при спреде ≥0.40%")
 
     await asyncio.gather(
         binance_listener(engine),

@@ -114,6 +114,22 @@ class SpreadEvent(Base):
     ts = Column(DateTime, nullable=False)
 
 
+class ArbPaperTrade(Base):
+    __tablename__ = "arb_paper_trades"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    symbol = Column(String(20), nullable=False)
+    buy_exchange = Column(String(20), nullable=False)
+    sell_exchange = Column(String(20), nullable=False)
+    buy_price = Column(Float, nullable=False)
+    sell_price = Column(Float, nullable=False)
+    size_usdt = Column(Float, nullable=False)
+    gross_pct = Column(Float, nullable=False)
+    net_pct = Column(Float, nullable=False)
+    pnl_usdt = Column(Float, nullable=False)
+    book_age_ms = Column(Integer)
+    ts = Column(DateTime, nullable=False)
+
+
 def get_engine(database_url: str):
     return create_engine(database_url, echo=False)
 
