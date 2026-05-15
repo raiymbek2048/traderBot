@@ -131,7 +131,7 @@ class BybitClient:
 
     def _auth_headers(self, params: dict) -> dict:
         ts = int(time.time() * 1000)
-        recv_window = 5000
+        recv_window = 10000
         param_str = str(ts) + self.api_key + str(recv_window)
         sorted_params = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
         param_str += sorted_params
