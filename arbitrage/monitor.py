@@ -28,7 +28,7 @@ from shared.config import load_config
 from shared.utils import utcnow
 
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT"]
-MIN_SPREAD_PCT   = 0.003   # 0.30% — log threshold
+MIN_SPREAD_PCT   = 0.001   # 0.10% — log threshold (диагностика)
 ALERT_SPREAD_PCT = 0.003   # 0.30% — paper trade threshold
 MAX_BOOK_AGE_MS  = 5000    # данные старше 5 сек считаем stale
 SAVE_COOLDOWN    = 1.0     # секунд между записями одного символа
