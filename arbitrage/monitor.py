@@ -28,8 +28,8 @@ from shared.config import load_config
 from shared.utils import utcnow
 
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT"]
-MIN_SPREAD_PCT   = 0.001   # 0.10% — log threshold (диагностика)
-ALERT_SPREAD_PCT = 0.003   # 0.30% — paper trade threshold
+MIN_SPREAD_PCT   = 0.002   # 0.20% — log/save threshold
+ALERT_SPREAD_PCT = 0.003   # 0.30% — paper trade + Telegram threshold
 MAX_BOOK_AGE_MS  = 5000    # данные старше 5 сек считаем stale
 SAVE_COOLDOWN    = 1.0     # секунд между записями одного символа
 WS_SILENCE_SEC   = 30      # если нет обновлений дольше — переподключаемся
