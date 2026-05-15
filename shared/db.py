@@ -159,6 +159,32 @@ class ArbRealTrade(Base):
     ts_filled = Column(DateTime)
 
 
+class FundingPosition(Base):
+    __tablename__ = "funding_positions"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    symbol = Column(String(20), nullable=False)
+    spot_exchange = Column(String(20), default="bybit")
+    perp_exchange = Column(String(20), default="bybit")
+    spot_order_id = Column(String(50))
+    perp_order_id = Column(String(50))
+    size_usdt = Column(Float, nullable=False)
+    spot_qty = Column(Float)              # сколько монет куплено в споте
+    perp_qty = Column(Float)              # сколько монет зашортено в перпе
+    spot_entry_price = Column(Float)
+    perp_entry_price = Column(Float)
+    spot_exit_price = Column(Float)
+    perp_exit_price = Column(Float)
+    funding_rate_open = Column(Float)     # фандинг в момент открытия
+    funding_rate_close = Column(Float)    # фандинг в момент закрытия
+    funding_collected_usdt = Column(Float, default=0.0)  # накоплено фандинга
+    pnl_usdt = Column(Float)             # итоговый PnL
+    status = Column(String(20), default="open")  # open / closed / failed
+    error = Column(Text)
+    paper = Column(Boolean, default=True)
+    opened_at = Column(DateTime, default=utcnow)
+    closed_at = Column(DateTime)
+
+
 def get_engine(database_url: str):
     return create_engine(database_url, echo=False)
 
