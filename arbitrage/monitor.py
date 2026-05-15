@@ -27,6 +27,9 @@ from shared.db import init_db, SpreadEvent, ArbPaperTrade
 from shared.config import load_config
 from shared.utils import utcnow
 
+# очередь для передачи сигналов в executor (если запущен в одном процессе)
+_exec_queue: asyncio.Queue | None = None
+
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT"]
 MIN_SPREAD_PCT   = 0.002   # 0.20% — log/save threshold
 ALERT_SPREAD_PCT = 0.003   # 0.30% — paper trade + Telegram threshold
@@ -289,7 +292,19 @@ async def _check_spread(sym: str, engine) -> None:
     if gross < ALERT_SPREAD_PCT:
         return
 
-    pnl_usdt = round(PAPER_SIZE_USDT * net / 1, 4)
+    # отправляем сигнал в executor если он подключён
+    if _exec_queue is not None:
+        try:
+            _exec_queue.put_nowait({
+                "symbol": sym, "buy_ex": result["buy_ex"], "sell_ex": result["sell_ex"],
+                "gross": gross, "net": net,
+                "buy_price": buy_price, "sell_price": sell_price,
+                "book_age_ms": result["book_age_ms"],
+            })
+        except asyncio.QueueFull:
+            pass
+
+    pnl_usdt = round(PAPER_SIZE_USDT * net, 4)
 
     paper = ArbPaperTrade(
         symbol=sym,

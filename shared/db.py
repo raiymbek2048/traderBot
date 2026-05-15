@@ -130,6 +130,35 @@ class ArbPaperTrade(Base):
     ts = Column(DateTime, nullable=False)
 
 
+class ArbRealTrade(Base):
+    __tablename__ = "arb_real_trades"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    symbol = Column(String(20), nullable=False)
+    buy_exchange = Column(String(20), nullable=False)
+    sell_exchange = Column(String(20), nullable=False)
+    # ордера
+    buy_order_id = Column(String(50))
+    sell_order_id = Column(String(50))
+    # цены и объём
+    target_size_usdt = Column(Float, nullable=False)
+    buy_price_target = Column(Float)    # цена в момент сигнала
+    sell_price_target = Column(Float)
+    buy_price_filled = Column(Float)    # реальная цена исполнения
+    sell_price_filled = Column(Float)
+    buy_qty_filled = Column(Float)      # реально куплено (в монетах)
+    sell_qty_filled = Column(Float)
+    # результат
+    gross_pct = Column(Float)           # спред в момент сигнала
+    net_pct = Column(Float)
+    pnl_usdt = Column(Float)            # реальный PnL после исполнения
+    slippage_pct = Column(Float)        # gross_target - gross_filled
+    # статус
+    status = Column(String(20), default="open")  # open / filled / failed / partial
+    error = Column(Text)
+    ts_signal = Column(DateTime, nullable=False)
+    ts_filled = Column(DateTime)
+
+
 def get_engine(database_url: str):
     return create_engine(database_url, echo=False)
 

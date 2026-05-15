@@ -23,6 +23,10 @@ def _bool(key: str, default: bool) -> bool:
 
 @dataclass
 class Config:
+    # Binance
+    binance_api_key: str
+    binance_api_secret: str
+
     # Bybit
     bybit_api_key: str
     bybit_api_secret: str
@@ -60,6 +64,8 @@ class Config:
 
 def load_config() -> Config:
     return Config(
+        binance_api_key=_optional("BINANCE_API_KEY", ""),
+        binance_api_secret=_optional("BINANCE_API_SECRET", ""),
         bybit_api_key=_optional("BYBIT_API_KEY", ""),
         bybit_api_secret=_optional("BYBIT_API_SECRET", ""),
         bybit_testnet=_bool("BYBIT_TESTNET", True),
