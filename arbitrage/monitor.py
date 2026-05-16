@@ -32,7 +32,7 @@ _exec_queue: asyncio.Queue | None = None
 
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT"]
 MIN_SPREAD_PCT   = 0.002   # 0.20% — log/save threshold
-ALERT_SPREAD_PCT = 0.003   # 0.30% — paper trade + Telegram threshold
+ALERT_SPREAD_PCT = 0.0022  # 0.22% — paper trade + Telegram threshold
 MAX_BOOK_AGE_MS  = 5000    # данные старше 5 сек считаем stale
 SAVE_COOLDOWN    = 1.0     # секунд между записями одного символа
 WS_SILENCE_SEC   = 30      # если нет обновлений дольше — переподключаемся
