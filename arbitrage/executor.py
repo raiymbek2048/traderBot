@@ -153,7 +153,8 @@ class BybitClient:
             coins = data["result"]["list"][0]["coin"]
             for c in coins:
                 if c["coin"] == asset:
-                    return float(c["availableToWithdraw"])
+                    val = c.get("availableToWithdraw") or c.get("walletBalance") or "0"
+                    return float(val) if val else 0.0
         except (KeyError, IndexError):
             pass
         return 0.0
