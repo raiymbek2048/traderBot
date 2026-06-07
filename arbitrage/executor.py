@@ -43,6 +43,9 @@ MIN_DEPTH_USDT   = 200.0    # минимальная ликвидность на
 MIN_BALANCE_USDT = 5.0      # минимальный баланс на бирже чтобы торговать
 MAX_DAILY_LOSS   = 20.0     # стоп на день если потеряли больше ($)
 COOLDOWN_SEC     = 3.0      # пауза между сделками по одному символу
+FEE_ROUNDTRIP    = 0.002    # 0.2% = 0.1% покупка + 0.1% продажа
+MIN_NET_MARGIN   = 0.0005   # 0.05% чистыми минимум — иначе не торгуем
+MIN_LIVE_GROSS   = FEE_ROUNDTRIP + MIN_NET_MARGIN  # 0.25% спред до исполнения
 
 # очередь сигналов от monitor.py → executor.py
 signal_queue: asyncio.Queue = asyncio.Queue(maxsize=100)
@@ -119,6 +122,19 @@ class BinanceClient:
         data_enc = urllib.parse.urlencode(params).encode()
         return await _http("POST", url, headers=self._headers(), data=data_enc)
 
+    async def place_market_order_base(self, symbol: str, side: str, base_qty: float) -> dict:
+        """Маркет-ордер по точному количеству монет (для аварийного закрытия ноги)."""
+        ts = int(time.time() * 1000)
+        params = {
+            "symbol": symbol, "side": side.upper(), "type": "MARKET",
+            "quantity": f"{base_qty:.8f}".rstrip("0").rstrip("."),
+            "timestamp": ts,
+        }
+        params["signature"] = _sign_binance(params, self.api_secret)
+        url = f"{self.BASE}/api/v3/order"
+        return await _http("POST", url, headers=self._headers(),
+                           data=urllib.parse.urlencode(params).encode())
+
 
 # ── Bybit API ──────────────────────────────────────────────────────────────────
 
@@ -172,6 +188,17 @@ class BybitClient:
             "orderType": "Market",
             "marketUnit": "quoteCoin",
             "qty": f"{quote_qty:.2f}",
+        }
+        headers = self._auth_headers(body)
+        url = f"{self.BASE}/v5/order/create"
+        return await _http("POST", url, headers=headers, data=json.dumps(body).encode())
+
+    async def place_market_order_base(self, symbol: str, side: str, base_qty: float) -> dict:
+        """Маркет-ордер по точному количеству монет (для аварийного закрытия ноги)."""
+        body = {
+            "category": "spot", "symbol": symbol, "side": side.capitalize(),
+            "orderType": "Market", "marketUnit": "baseCoin",
+            "qty": f"{base_qty:.8f}".rstrip("0").rstrip("."),
         }
         headers = self._auth_headers(body)
         url = f"{self.BASE}/v5/order/create"
@@ -309,10 +336,10 @@ async def execute_trade(
         await _tg(f"⚠️ Низкий баланс на {buy_ex.upper()}: ${buy_bal:.2f}\nПополни счёт.")
         return
 
-    # 3. Текущий спред ещё выгоден?
+    # 3. Текущий спред ещё выгоден? (нужно покрыть комиссии 0.2% + маржу 0.05%)
     live_gross = (sell_price - buy_price) / buy_price
-    if live_gross < 0.002:   # если спред сдулся до <0.2% — пропускаем
-        logger.info(f"Spread gone before execution: {live_gross*100:.3f}%")
+    if live_gross < MIN_LIVE_GROSS:
+        logger.info(f"Spread gone before execution: {live_gross*100:.3f}% < {MIN_LIVE_GROSS*100:.3f}%")
         return
 
     # 4. Одновременно размещаем оба ордера
@@ -364,10 +391,40 @@ async def execute_trade(
     except Exception as e:
         status = "partial"; error_msg = (error_msg or "") + f" sell error: {e}"
 
+    # 5b. АВАРИЙНОЕ ЗАКРЫТИЕ ГОЛОЙ НОГИ
+    # Если исполнилась ровно одна нога — мы держим незахеджированную позицию.
+    # Немедленно закрываем её обратным market-ордером, чтобы убрать ценовой риск.
+    buy_ok  = bool(buy_filled)  and buy_filled  > 0
+    sell_ok = bool(sell_filled) and sell_filled > 0
+    if buy_ok != sell_ok:  # XOR — исполнилась только одна
+        status = "unwound"
+        try:
+            if buy_ok and not sell_ok:
+                # купили на buy_ex но не продали → продаём обратно на buy_ex
+                client = binance if buy_ex == "binance" else bybit
+                await client.place_market_order_base(sym, "Sell", buy_filled)
+                msg = f"купили {buy_filled} {sym} на {buy_ex}, продажа упала → закрыли обратно"
+            else:
+                # продали на sell_ex но не купили → выкупаем обратно на sell_ex
+                client = bybit if sell_ex == "bybit" else binance
+                await client.place_market_order_base(sym, "Buy", sell_filled)
+                msg = f"продали {sell_filled} {sym} на {sell_ex}, покупка упала → выкупили обратно"
+            logger.warning(f"[UNWIND] {msg}")
+            await _tg(f"🔁 <b>Аварийное закрытие ноги</b> {sym}\n{msg}\nПозиция выровнена, ценовой риск убран.")
+            error_msg = (error_msg or "") + " | unwound single leg"
+        except Exception as e:
+            status = "STUCK"
+            logger.error(f"[UNWIND FAILED] {sym}: {e}")
+            await _tg(
+                f"🆘 <b>КРИТИЧНО: голая нога не закрылась</b> {sym}\n"
+                f"{'купили' if buy_ok else 'продали'} но обратный ордер упал: {e}\n"
+                f"⚠️ ТРЕБУЕТСЯ РУЧНОЕ ВМЕШАТЕЛЬСТВО — закрой позицию вручную!"
+            )
+
     # 6. Считаем реальный PnL
     if buy_price_f and sell_price_f and buy_filled:
         real_gross = (sell_price_f - buy_price_f) / buy_price_f
-        real_net   = real_gross - 0.001  # 0.1% total комиссии
+        real_net   = real_gross - 0.002  # 0.2% = 0.1% покупка + 0.1% продажа
         pnl_usdt   = round(size_usdt * real_net, 4)
         slippage   = round((gross - real_gross) * 100, 4)
         _daily_pnl += pnl_usdt

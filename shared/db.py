@@ -123,10 +123,15 @@ class ArbPaperTrade(Base):
     buy_price = Column(Float, nullable=False)
     sell_price = Column(Float, nullable=False)
     size_usdt = Column(Float, nullable=False)
-    gross_pct = Column(Float, nullable=False)
-    net_pct = Column(Float, nullable=False)
-    pnl_usdt = Column(Float, nullable=False)
+    gross_pct = Column(Float, nullable=False)   # реалистичный VWAP-спред по глубине
+    net_pct = Column(Float, nullable=False)     # gross_pct - комиссии(×2) - реализм
+    pnl_usdt = Column(Float, nullable=False)     # SIZE * net (может быть отрицательным)
     book_age_ms = Column(Integer)
+    # --- realism v2 ---
+    naive_gross_pct = Column(Float)   # старый спред по топу стакана (для сравнения)
+    naive_net_pct = Column(Float)     # старый net (1 комиссия) — как было раньше
+    slippage_pct = Column(Float)      # наивный - реальный спред (стоимость глубины)
+    fillable = Column(Boolean)        # хватило ли ликвидности на size_usdt
     ts = Column(DateTime, nullable=False)
 
 
@@ -189,7 +194,27 @@ def get_engine(database_url: str):
     return create_engine(database_url, echo=False)
 
 
+def _migrate_arb_paper(engine) -> None:
+    """Добавляет новые колонки realism v2 в существующую таблицу (SQLite ALTER)."""
+    from sqlalchemy import text
+    new_cols = {
+        "naive_gross_pct": "FLOAT",
+        "naive_net_pct": "FLOAT",
+        "slippage_pct": "FLOAT",
+        "fillable": "BOOLEAN",
+    }
+    with engine.begin() as conn:
+        existing = {row[1] for row in conn.execute(text("PRAGMA table_info(arb_paper_trades)"))}
+        for col, typ in new_cols.items():
+            if col not in existing:
+                conn.execute(text(f"ALTER TABLE arb_paper_trades ADD COLUMN {col} {typ}"))
+
+
 def init_db(database_url: str):
     engine = get_engine(database_url)
     Base.metadata.create_all(engine)
+    try:
+        _migrate_arb_paper(engine)
+    except Exception:
+        pass  # таблицы ещё нет — create_all уже создал с новыми колонками
     return engine

@@ -1,9 +1,16 @@
-"""SpreadArb — Phase 1: мониторинг + бумажная симуляция.
+"""SpreadArb — Phase 1: мониторинг + РЕАЛИСТИЧНАЯ бумажная симуляция (v2).
 
-Подключается к Binance + Bybit WebSocket, при спреде ≥ ALERT_SPREAD_PCT:
-  - записывает SpreadEvent в БД
-  - создаёт ArbPaperTrade (бумажная сделка)
-  - отправляет Telegram алерт с PnL и дневной статистикой
+Что изменилось в v2 (честная модель):
+  • Глубокий стакан: Binance depth20, Bybit orderbook.50 (а не только топ)
+  • VWAP-цена исполнения на заданный объём (учитывает проскальзывание по глубине)
+  • Комиссии ×2 (покупка + продажа), раньше считалась только одна
+  • Реалистичный размер позиции (PAPER_SIZE_USDT=$100 по умолчанию)
+  • Пишем И наивную (топ стакана), И честную (VWAP) цифру — для сравнения
+
+При net-спреде ≥ ALERT_NET_PCT (после комиссий и слиппеджа):
+  - записывает SpreadEvent + ArbPaperTrade
+  - сигналит в executor
+  - шлёт Telegram алерт
 
 Run: python -m arbitrage.monitor
 """
@@ -13,7 +20,7 @@ import json
 import time
 import urllib.request
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import websockets
 from loguru import logger
@@ -31,12 +38,19 @@ from shared.utils import utcnow
 _exec_queue: asyncio.Queue | None = None
 
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT"]
-MIN_SPREAD_PCT   = 0.002   # 0.20% — log/save threshold
-ALERT_SPREAD_PCT = 0.0022  # 0.22% — paper trade + Telegram threshold
-MAX_BOOK_AGE_MS  = 5000    # данные старше 5 сек считаем stale
-SAVE_COOLDOWN    = 1.0     # секунд между записями одного символа
-WS_SILENCE_SEC   = 30      # если нет обновлений дольше — переподключаемся
-PAPER_SIZE_USDT  = 1000.0  # размер бумажной позиции в USDT
+
+# Комиссии (taker, спот). Две сделки за арбитраж → платим дважды.
+FEE_PER_SIDE   = 0.001              # 0.10% taker
+FEE_ROUNDTRIP  = FEE_PER_SIDE * 2   # 0.20% суммарно
+
+# Пороги теперь по ЧИСТОМУ спреду (после комиссий+слиппеджа), а не gross.
+MIN_NET_PCT    = -0.001             # логируем даже лёгкий минус (для статистики)
+ALERT_NET_PCT  = 0.0005             # 0.05% чистыми → paper trade + Telegram + executor
+
+MAX_BOOK_AGE_MS  = 5000
+SAVE_COOLDOWN    = 1.0
+WS_SILENCE_SEC   = 30
+PAPER_SIZE_USDT  = float(os.environ.get("PAPER_SIZE_USDT", "100.0"))  # реалистичный объём
 
 BINANCE_WS = "wss://stream.binance.com:9443/stream?streams="
 BYBIT_WS   = "wss://stream.bybit.com/v5/public/linear"
@@ -46,81 +60,116 @@ _tg_chat:  str = ""
 
 
 @dataclass
-class BookTop:
+class Book:
     exchange: str
     symbol: str
-    bid: float
-    ask: float
-    ts: float   # unix ms когда получено
+    bids: list[tuple[float, float]]   # (price, qty), убыв. по цене
+    asks: list[tuple[float, float]]   # (price, qty), возр. по цене
+    ts: float                         # unix ms когда получено
 
 
 # ── shared state ───────────────────────────────────────────────────────────────
 
-books: dict[str, BookTop] = {}
-_last_saved: dict[str, float] = {}    # symbol → unix ts последней записи
-_last_rx: dict[str, float] = {}       # "binance"/"bybit" → unix ts последнего пакета
-
-# Bybit держит in-memory стакан чтобы правильно применять delta-обновления
-_bybit_ob: dict[str, dict] = {}       # symbol → {"bids": {price: qty}, "asks": {...}}
+books: dict[str, Book] = {}
+_last_saved: dict[str, float] = {}
+_last_rx: dict[str, float] = {}
+_bybit_ob: dict[str, dict] = {}       # symbol → {"bids": {price:qty}, "asks": {...}}
 
 
-# ── spread computation ─────────────────────────────────────────────────────────
+# ── VWAP fill ────────────────────────────────────────────────────────────────────
 
-def compute_spread(sym: str) -> dict | None:
+def vwap_fill(levels: list[tuple[float, float]], size_usdt: float) -> tuple[float, bool]:
     """
-    Returns dict с полными данными или None.
-    Проверяет freshness обоих книг.
+    Проходит уровни стакана пока не наберёт size_usdt.
+    levels — для покупки asks (возр.), для продажи bids (убыв.).
+    Возвращает (средневзвешенная цена, хватило_ли_ликвидности).
     """
+    remaining = size_usdt
+    cost = 0.0          # сколько USDT потратили/получили
+    base = 0.0          # сколько монет набрали
+    for price, qty in levels:
+        if price <= 0 or qty <= 0:
+            continue
+        level_usdt = price * qty
+        take = min(remaining, level_usdt)
+        base += take / price
+        cost += take
+        remaining -= take
+        if remaining <= 1e-9:
+            break
+    if remaining > 1e-9 or base <= 0:
+        return 0.0, False          # глубины не хватило
+    return cost / base, True
+
+
+# ── spread computation (realistic) ───────────────────────────────────────────────
+
+def compute_spread(sym: str, size_usdt: float) -> dict | None:
     b = books.get(f"binance:{sym}")
     y = books.get(f"bybit:{sym}")
-    if not b or not y:
+    if not b or not y or not b.asks or not b.bids or not y.asks or not y.bids:
         return None
 
     now_ms = time.time() * 1000
-    b_age = now_ms - b.ts
-    y_age = now_ms - y.ts
-    book_age = max(b_age, y_age)
-
+    book_age = max(now_ms - b.ts, now_ms - y.ts)
     if book_age > MAX_BOOK_AGE_MS:
-        return None  # stale данные — игнорируем
+        return None
 
-    gross = net = 0.0
-    buy_ex = sell_ex = ""
+    b_ask, b_bid = b.asks[0][0], b.bids[0][0]
+    y_ask, y_bid = y.asks[0][0], y.bids[0][0]
 
-    if b.ask < y.bid:
-        gross = (y.bid - b.ask) / b.ask
-        net   = gross - 0.001
+    # направление по топу стакана
+    if b_ask < y_bid:
         buy_ex, sell_ex = "binance", "bybit"
-    elif y.ask < b.bid:
-        gross = (b.bid - y.ask) / y.ask
-        net   = gross - 0.001
+        buy_book, sell_book = b, y
+        naive_buy, naive_sell = b_ask, y_bid
+    elif y_ask < b_bid:
         buy_ex, sell_ex = "bybit", "binance"
+        buy_book, sell_book = y, b
+        naive_buy, naive_sell = y_ask, b_bid
     else:
         return None
 
+    # наивный спред (топ стакана, как было раньше)
+    naive_gross = (naive_sell - naive_buy) / naive_buy
+    naive_net   = naive_gross - FEE_PER_SIDE        # старая формула: одна комиссия
+
+    # реалистичный спред: VWAP на size_usdt по глубине
+    vwap_buy,  ok_buy  = vwap_fill(buy_book.asks,  size_usdt)
+    vwap_sell, ok_sell = vwap_fill(sell_book.bids, size_usdt)
+    fillable = ok_buy and ok_sell
+
+    if fillable:
+        real_gross = (vwap_sell - vwap_buy) / vwap_buy
+    else:
+        real_gross = naive_gross   # не хватило глубины — берём наивный, но пометим fillable=False
+
+    real_net  = real_gross - FEE_ROUNDTRIP          # честно: две комиссии
+    slippage  = naive_gross - real_gross            # стоимость глубины
+
     return {
-        "gross": gross,
-        "net": net,
-        "buy_ex": buy_ex,
-        "sell_ex": sell_ex,
-        "binance_bid": b.bid,
-        "binance_ask": b.ask,
-        "bybit_bid": y.bid,
-        "bybit_ask": y.ask,
+        "buy_ex": buy_ex, "sell_ex": sell_ex,
+        "naive_gross": naive_gross, "naive_net": naive_net,
+        "real_gross": real_gross, "real_net": real_net,
+        "slippage": slippage, "fillable": fillable,
+        "buy_price": vwap_buy if fillable else naive_buy,
+        "sell_price": vwap_sell if fillable else naive_sell,
+        "binance_bid": b_bid, "binance_ask": b_ask,
+        "bybit_bid": y_bid, "bybit_ask": y_ask,
         "book_age_ms": round(book_age),
     }
 
 
-# ── Binance WebSocket ──────────────────────────────────────────────────────────
+# ── Binance WebSocket (depth20) ──────────────────────────────────────────────────
 
 async def binance_listener(engine) -> None:
-    streams = "/".join(f"{s.lower()}@bookTicker" for s in SYMBOLS)
+    streams = "/".join(f"{s.lower()}@depth20@100ms" for s in SYMBOLS)
     url = BINANCE_WS + streams
     backoff = 2
     while True:
         try:
-            async with websockets.connect(url, ping_interval=None) as ws:
-                logger.info("Binance WS connected")
+            async with websockets.connect(url, ping_interval=None, max_size=2**21) as ws:
+                logger.info("Binance WS connected (depth20)")
                 backoff = 2
                 while True:
                     try:
@@ -129,14 +178,19 @@ async def binance_listener(engine) -> None:
                         raise RuntimeError(f"Binance WS silent for {WS_SILENCE_SEC}s — forcing reconnect")
                     _last_rx["binance"] = time.time()
                     msg = json.loads(raw)
+                    stream = msg.get("stream", "")
                     data = msg.get("data", msg)
-                    sym = data.get("s")
+                    # имя стрима: btcusdt@depth20@100ms
+                    sym = stream.split("@")[0].upper() if stream else None
                     if sym not in SYMBOLS:
                         continue
-                    books[f"binance:{sym}"] = BookTop(
+                    bids = [(float(p), float(q)) for p, q in data.get("bids", [])]
+                    asks = [(float(p), float(q)) for p, q in data.get("asks", [])]
+                    if not bids or not asks:
+                        continue
+                    books[f"binance:{sym}"] = Book(
                         exchange="binance", symbol=sym,
-                        bid=float(data["b"]), ask=float(data["a"]),
-                        ts=time.time() * 1000,
+                        bids=bids, asks=asks, ts=time.time() * 1000,
                     )
                     await _check_spread(sym, engine)
         except Exception as e:
@@ -145,51 +199,41 @@ async def binance_listener(engine) -> None:
             backoff = min(backoff * 2, 60)
 
 
-# ── Bybit WebSocket ────────────────────────────────────────────────────────────
+# ── Bybit WebSocket (orderbook.50) ───────────────────────────────────────────────
 
-def _apply_bybit_delta(sym: str, msg_type: str, bids: list, asks: list) -> tuple[float, float] | None:
-    """
-    Применяет snapshot или delta к in-memory стакану.
-    Возвращает (best_bid, best_ask) или None если стакан пуст.
-    """
+def _apply_bybit_delta(sym: str, msg_type: str, bids: list, asks: list) -> bool:
     if sym not in _bybit_ob:
         _bybit_ob[sym] = {"bids": {}, "asks": {}}
-
     ob = _bybit_ob[sym]
-
     if msg_type == "snapshot":
         ob["bids"] = {float(p): float(q) for p, q in bids}
         ob["asks"] = {float(p): float(q) for p, q in asks}
-    else:  # delta
+    else:
         for p, q in bids:
             fp, fq = float(p), float(q)
-            if fq == 0:
-                ob["bids"].pop(fp, None)
-            else:
-                ob["bids"][fp] = fq
+            ob["bids"].pop(fp, None) if fq == 0 else ob["bids"].__setitem__(fp, fq)
         for p, q in asks:
             fp, fq = float(p), float(q)
-            if fq == 0:
-                ob["asks"].pop(fp, None)
-            else:
-                ob["asks"][fp] = fq
+            ob["asks"].pop(fp, None) if fq == 0 else ob["asks"].__setitem__(fp, fq)
+    return bool(ob["bids"] and ob["asks"])
 
-    if not ob["bids"] or not ob["asks"]:
-        return None
-    best_bid = max(ob["bids"])
-    best_ask = min(ob["asks"])
-    return best_bid, best_ask
+
+def _bybit_sorted(sym: str) -> tuple[list, list]:
+    ob = _bybit_ob[sym]
+    bids = sorted(ob["bids"].items(), key=lambda x: -x[0])
+    asks = sorted(ob["asks"].items(), key=lambda x: x[0])
+    return bids, asks
 
 
 async def bybit_listener(engine) -> None:
     backoff = 2
     while True:
         try:
-            async with websockets.connect(BYBIT_WS, ping_interval=None) as ws:
-                logger.info("Bybit WS connected")
+            async with websockets.connect(BYBIT_WS, ping_interval=None, max_size=2**21) as ws:
+                logger.info("Bybit WS connected (orderbook.50)")
                 backoff = 2
                 _bybit_ob.clear()
-                sub = {"op": "subscribe", "args": [f"orderbook.1.{s}" for s in SYMBOLS]}
+                sub = {"op": "subscribe", "args": [f"orderbook.50.{s}" for s in SYMBOLS]}
                 await ws.send(json.dumps(sub))
                 while True:
                     try:
@@ -206,15 +250,13 @@ async def bybit_listener(engine) -> None:
                         continue
                     msg_type = msg.get("type", "delta")
                     data = msg.get("data", {})
-                    bids = data.get("b", [])
-                    asks = data.get("a", [])
-                    result = _apply_bybit_delta(sym, msg_type, bids, asks)
-                    if result is None:
+                    ok = _apply_bybit_delta(sym, msg_type, data.get("b", []), data.get("a", []))
+                    if not ok:
                         continue
-                    best_bid, best_ask = result
-                    books[f"bybit:{sym}"] = BookTop(
+                    bids, asks = _bybit_sorted(sym)
+                    books[f"bybit:{sym}"] = Book(
                         exchange="bybit", symbol=sym,
-                        bid=best_bid, ask=best_ask,
+                        bids=bids, asks=asks,
                         ts=float(msg.get("ts", time.time() * 1000)),
                     )
                     await _check_spread(sym, engine)
@@ -232,9 +274,7 @@ async def _tg_send(text: str) -> None:
     try:
         url = f"https://api.telegram.org/bot{_tg_token}/sendMessage"
         data = urllib.parse.urlencode({
-            "chat_id": _tg_chat,
-            "text": text,
-            "parse_mode": "HTML",
+            "chat_id": _tg_chat, "text": text, "parse_mode": "HTML",
         }).encode()
         await asyncio.get_event_loop().run_in_executor(
             None, lambda: urllib.request.urlopen(url, data, timeout=5)
@@ -246,8 +286,8 @@ async def _tg_send(text: str) -> None:
 # ── spread checker ─────────────────────────────────────────────────────────────
 
 async def _check_spread(sym: str, engine) -> None:
-    result = compute_spread(sym)
-    if result is None or result["gross"] < MIN_SPREAD_PCT:
+    r = compute_spread(sym, PAPER_SIZE_USDT)
+    if r is None or r["real_net"] < MIN_NET_PCT:
         return
 
     now = time.time()
@@ -255,91 +295,75 @@ async def _check_spread(sym: str, engine) -> None:
         return
     _last_saved[sym] = now
 
-    gross = result["gross"]
-    net   = result["net"]
-    gross_pct = round(gross * 100, 4)
-    net_pct   = round(net * 100, 4)
-    buy_price  = result["binance_ask"] if result["buy_ex"] == "binance" else result["bybit_ask"]
-    sell_price = result["bybit_bid"]   if result["sell_ex"] == "bybit"  else result["binance_bid"]
+    real_gross_pct = round(r["real_gross"] * 100, 4)
+    real_net_pct   = round(r["real_net"] * 100, 4)
+    naive_gross_pct = round(r["naive_gross"] * 100, 4)
+    naive_net_pct   = round(r["naive_net"] * 100, 4)
+    slippage_pct    = round(r["slippage"] * 100, 4)
 
     event = SpreadEvent(
-        symbol=sym,
-        buy_exchange=result["buy_ex"],
-        sell_exchange=result["sell_ex"],
-        buy_price=buy_price,
-        sell_price=sell_price,
-        spread_pct=gross_pct,
-        net_pct=net_pct,
-        binance_bid=result["binance_bid"],
-        binance_ask=result["binance_ask"],
-        bybit_bid=result["bybit_bid"],
-        bybit_ask=result["bybit_ask"],
-        book_age_ms=result["book_age_ms"],
-        ts=utcnow(),
+        symbol=sym, buy_exchange=r["buy_ex"], sell_exchange=r["sell_ex"],
+        buy_price=r["buy_price"], sell_price=r["sell_price"],
+        spread_pct=real_gross_pct, net_pct=real_net_pct,
+        binance_bid=r["binance_bid"], binance_ask=r["binance_ask"],
+        bybit_bid=r["bybit_bid"], bybit_ask=r["bybit_ask"],
+        book_age_ms=r["book_age_ms"], ts=utcnow(),
     )
-
     with Session(engine) as session:
         session.add(event)
         session.commit()
 
-    level = "🚨 ALERT" if gross >= ALERT_SPREAD_PCT else "📊"
+    is_alert = r["real_net"] >= ALERT_NET_PCT and r["fillable"]
+    level = "🚨 ALERT" if is_alert else ("📊" if r["fillable"] else "🚫 thin")
     logger.info(
-        f"{level} {sym} spread={gross_pct:.3f}% net={net_pct:.3f}% "
-        f"buy@{result['buy_ex']} sell@{result['sell_ex']} "
-        f"age={result['book_age_ms']}ms"
+        f"{level} {sym} real_net={real_net_pct:.3f}% (naive={naive_net_pct:.3f}% "
+        f"slip={slippage_pct:.3f}%) fill={r['fillable']} "
+        f"buy@{r['buy_ex']} sell@{r['sell_ex']} age={r['book_age_ms']}ms"
     )
 
-    if gross < ALERT_SPREAD_PCT:
+    if not is_alert:
         return
 
-    # отправляем сигнал в executor если он подключён
     if _exec_queue is not None:
         try:
             _exec_queue.put_nowait({
-                "symbol": sym, "buy_ex": result["buy_ex"], "sell_ex": result["sell_ex"],
-                "gross": gross, "net": net,
-                "buy_price": buy_price, "sell_price": sell_price,
-                "book_age_ms": result["book_age_ms"],
+                "symbol": sym, "buy_ex": r["buy_ex"], "sell_ex": r["sell_ex"],
+                "gross": r["real_gross"], "net": r["real_net"],
+                "buy_price": r["buy_price"], "sell_price": r["sell_price"],
+                "book_age_ms": r["book_age_ms"],
             })
         except asyncio.QueueFull:
             pass
 
-    pnl_usdt = round(PAPER_SIZE_USDT * net, 4)
+    pnl_usdt = round(PAPER_SIZE_USDT * r["real_net"], 4)
 
     paper = ArbPaperTrade(
-        symbol=sym,
-        buy_exchange=result["buy_ex"],
-        sell_exchange=result["sell_ex"],
-        buy_price=buy_price,
-        sell_price=sell_price,
+        symbol=sym, buy_exchange=r["buy_ex"], sell_exchange=r["sell_ex"],
+        buy_price=r["buy_price"], sell_price=r["sell_price"],
         size_usdt=PAPER_SIZE_USDT,
-        gross_pct=gross_pct,
-        net_pct=net_pct,
-        pnl_usdt=pnl_usdt,
-        book_age_ms=result["book_age_ms"],
-        ts=utcnow(),
+        gross_pct=real_gross_pct, net_pct=real_net_pct, pnl_usdt=pnl_usdt,
+        naive_gross_pct=naive_gross_pct, naive_net_pct=naive_net_pct,
+        slippage_pct=slippage_pct, fillable=r["fillable"],
+        book_age_ms=r["book_age_ms"], ts=utcnow(),
     )
-
     with Session(engine) as session:
         session.add(paper)
         session.commit()
-
         today_start = utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
         day_trades = session.scalar(
-            select(func.count(ArbPaperTrade.id))
-            .where(ArbPaperTrade.ts >= today_start)
+            select(func.count(ArbPaperTrade.id)).where(ArbPaperTrade.ts >= today_start)
         ) or 0
         day_pnl = session.scalar(
-            select(func.sum(ArbPaperTrade.pnl_usdt))
-            .where(ArbPaperTrade.ts >= today_start)
+            select(func.sum(ArbPaperTrade.pnl_usdt)).where(ArbPaperTrade.ts >= today_start)
         ) or 0.0
 
     msg = (
-        f"💱 <b>SpreadArb PAPER TRADE</b>\n"
-        f"<b>{sym}</b>: buy@{result['buy_ex'].upper()} → sell@{result['sell_ex'].upper()}\n"
+        f"💱 <b>SpreadArb PAPER (realistic)</b>\n"
+        f"<b>{sym}</b>: buy@{r['buy_ex'].upper()} → sell@{r['sell_ex'].upper()}\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"Gross: <b>{gross_pct:.3f}%</b>  |  Net: <b>{net_pct:.3f}%</b>\n"
-        f"Size: ${PAPER_SIZE_USDT:,.0f}  |  PnL: <b>+${pnl_usdt:.2f}</b>\n"
+        f"Real net: <b>{real_net_pct:.3f}%</b>  (naive {naive_net_pct:.3f}%)\n"
+        f"Slippage: {slippage_pct:.3f}%  |  Size: ${PAPER_SIZE_USDT:,.0f}\n"
+        f"PnL: <b>+${pnl_usdt:.3f}</b>\n"
         f"━━━━━━━━━━━━━━━\n"
         f"📊 Сегодня: {day_trades} сделок  |  +${day_pnl:.2f} USDT"
     )
@@ -349,13 +373,11 @@ async def _check_spread(sym: str, engine) -> None:
 # ── watchdog ───────────────────────────────────────────────────────────────────
 
 async def watchdog() -> None:
-    """Логирует если нет данных от биржи дольше WS_SILENCE_SEC."""
     while True:
         await asyncio.sleep(30)
         now = time.time()
         for ex in ("binance", "bybit"):
-            last = _last_rx.get(ex, 0)
-            silence = now - last
+            silence = now - _last_rx.get(ex, 0)
             if silence > WS_SILENCE_SEC:
                 logger.warning(f"⚠️  {ex} WS silent for {silence:.0f}s — reconnect should trigger")
 
@@ -363,37 +385,26 @@ async def watchdog() -> None:
 # ── stats printer ──────────────────────────────────────────────────────────────
 
 async def stats_printer(engine) -> None:
-    """Hourly summary — только за последний час."""
     while True:
         await asyncio.sleep(3600)
-        from sqlalchemy import func, select
-        from shared.db import SpreadEvent as SE
         from datetime import timedelta
-
         hour_ago = utcnow() - timedelta(hours=1)
-
         with Session(engine) as session:
             rows = session.execute(
-                select(SE.symbol, func.count(), func.avg(SE.spread_pct), func.max(SE.spread_pct))
-                .where(SE.ts >= hour_ago)
-                .where(SE.spread_pct >= ALERT_SPREAD_PCT * 100)
-                .group_by(SE.symbol)
+                select(ArbPaperTrade.symbol, func.count(), func.avg(ArbPaperTrade.net_pct),
+                       func.sum(ArbPaperTrade.pnl_usdt))
+                .where(ArbPaperTrade.ts >= hour_ago)
+                .group_by(ArbPaperTrade.symbol)
             ).all()
-            total_hour = session.scalar(
-                select(func.count(SE.id)).where(SE.ts >= hour_ago)
+            total = session.scalar(
+                select(func.count(SpreadEvent.id)).where(SpreadEvent.ts >= hour_ago)
             ) or 0
-            stale = session.scalar(
-                select(func.count(SE.id))
-                .where(SE.ts >= hour_ago)
-                .where(SE.book_age_ms > 2000)
-            ) or 0
-
-        logger.info(f"=== Hourly arbitrage summary | total={total_hour} stale(>2s)={stale} ===")
+        logger.info(f"=== Hourly summary | spread_events={total} | paper trades: ===")
         if rows:
-            for sym, cnt, avg_sp, max_sp in rows:
-                logger.info(f"  {sym}: {cnt} alert signals | avg={avg_sp:.3f}% | max={max_sp:.3f}%")
+            for sym, cnt, avg_net, pnl in rows:
+                logger.info(f"  {sym}: {cnt} trades | avg_net={avg_net:.3f}% | PnL=${pnl:.2f}")
         else:
-            logger.info("  No alert-level spreads this hour")
+            logger.info("  No profitable (net>0) paper trades this hour")
 
 
 # ── entrypoint ─────────────────────────────────────────────────────────────────
@@ -409,8 +420,11 @@ async def main() -> None:
     logger.add("logs/arbitrage_monitor.log", rotation="50 MB", retention="90 days")
 
     engine = init_db(cfg.database_url)
-    logger.info(f"SpreadArb monitor started | symbols={SYMBOLS} | paper_size=${PAPER_SIZE_USDT:.0f} | alert≥{ALERT_SPREAD_PCT*100:.2f}% | max_book_age={MAX_BOOK_AGE_MS}ms")
-    await _tg_send("🚀 <b>SpreadArb запущен</b>\nМониторю Binance↔Bybit | алерт при спреде ≥0.40%")
+    logger.info(
+        f"SpreadArb monitor v2 (realistic) | symbols={SYMBOLS} | "
+        f"size=${PAPER_SIZE_USDT:.0f} | fees={FEE_ROUNDTRIP*100:.2f}% | alert_net≥{ALERT_NET_PCT*100:.3f}%"
+    )
+    await _tg_send("🚀 <b>SpreadArb v2 запущен</b>\nЧестная модель: VWAP по глубине + комиссии ×2")
 
     await asyncio.gather(
         binance_listener(engine),
