@@ -344,10 +344,114 @@ async def close_position(
 
 signal_queue: asyncio.Queue = asyncio.Queue()
 
+# фандинг на Bybit начисляется в 00:00 / 08:00 / 16:00 UTC
+FUNDING_HOURS = (0, 8, 16)
 
-async def run(engine, bybit: BybitClient, paper: bool, size_usdt: float) -> None:
-    """Главный loop executor: читает сигналы из очереди."""
-    open_positions: dict[str, int] = {}  # {symbol: position_id}
+
+def _load_open_positions(engine) -> dict[str, int]:
+    """Восстанавливает открытые позиции из БД (после рестарта)."""
+    from sqlalchemy import select
+    result: dict[str, int] = {}
+    with Session(engine) as session:
+        rows = session.execute(
+            select(FundingPosition.symbol, FundingPosition.id)
+            .where(FundingPosition.status == "open")
+        ).all()
+        for sym, pid in rows:
+            result[sym] = pid
+    return result
+
+
+def _fetch_funding_rates() -> dict[str, float]:
+    """{symbol: funding_rate} по linear-перпам (public, без авторизации)."""
+    import urllib.request, json as _json
+    url = "https://api.bybit.com/v5/market/tickers?category=linear"
+    with urllib.request.urlopen(url, timeout=10) as r:
+        data = _json.loads(r.read())
+    out: dict[str, float] = {}
+    for it in data.get("result", {}).get("list", []):
+        fr = it.get("fundingRate", "")
+        if fr:
+            out[it.get("symbol", "")] = float(fr)
+    return out
+
+
+def _seconds_to_next_settlement() -> float:
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(timezone.utc)
+    candidates = []
+    for h in FUNDING_HOURS:
+        t = now.replace(hour=h, minute=0, second=0, microsecond=0)
+        if t <= now:
+            t += timedelta(days=1)
+        candidates.append(t)
+    # ближайший из сегодня/завтра
+    for h in FUNDING_HOURS:
+        t = now.replace(hour=h, minute=0, second=0, microsecond=0)
+        if t > now:
+            candidates.append(t)
+    nxt = min(candidates)
+    return (nxt - now).total_seconds()
+
+
+async def accrual_loop(engine, open_positions: dict[str, int]) -> None:
+    """Каждые 8ч (в момент сеттлмента) начисляет фандинг на открытые позиции.
+
+    Мы SHORT перп: при funding_rate > 0 шорты ПОЛУЧАЮТ выплату от лонгов.
+    collected += funding_rate * notional.
+    """
+    from datetime import datetime, timezone
+    while True:
+        wait = _seconds_to_next_settlement()
+        logger.info(f"[accrual] следующий сеттлмент через {wait/3600:.2f}ч")
+        await asyncio.sleep(wait + 5)  # +5с чтобы биржа успела зафиксировать
+        try:
+            rates = await asyncio.get_event_loop().run_in_executor(None, _fetch_funding_rates)
+        except Exception as e:
+            logger.warning(f"[accrual] не смог получить рейты: {e}")
+            continue
+        with Session(engine) as session:
+            from sqlalchemy import select
+            positions = session.execute(
+                select(FundingPosition).where(FundingPosition.status == "open")
+            ).scalars().all()
+            total_payment = 0.0
+            for pos in positions:
+                fr = rates.get(pos.symbol)
+                if fr is None:
+                    continue
+                # шорт получает fr * notional при fr>0 (и платит при fr<0)
+                payment = fr * pos.size_usdt
+                pos.funding_collected_usdt = (pos.funding_collected_usdt or 0.0) + payment
+                total_payment += payment
+                logger.info(f"[accrual] {pos.symbol}: fr={fr*100:.4f}% → {payment:+.4f} USDT "
+                            f"(всего {pos.funding_collected_usdt:+.4f})")
+            session.commit()
+        if positions:
+            ts = datetime.now(timezone.utc).strftime("%H:%M UTC")
+            await _send_tg(
+                f"💰 Фандинг начислен ({ts})\n"
+                f"Позиций: {len(positions)}\n"
+                f"Выплата за сеттлмент: {total_payment:+.4f} USDT"
+            )
+
+
+async def run(engine, bybit: BybitClient, paper: bool, size_usdt: float,
+              open_positions: dict[str, int] | None = None) -> None:
+    """Главный loop executor: читает сигналы из очереди.
+
+    open_positions — ОБЩИЙ словарь с monitor (единый источник состояния).
+    При старте восстанавливается из БД.
+    """
+    if open_positions is None:
+        open_positions = {}
+    # восстановление после рестарта
+    restored = _load_open_positions(engine)
+    open_positions.update(restored)
+    if restored:
+        logger.info(f"Восстановлено открытых позиций из БД: {restored}")
+        await _send_tg(f"♻️ Восстановлено позиций после рестарта: {len(restored)}\n"
+                       + "\n".join(f"  {s} (id={i})" for s, i in restored.items()))
 
     while True:
         signal = await signal_queue.get()
