@@ -181,10 +181,12 @@ def _open_position(engine, signal, cfg, notifier: Notifier) -> None:
 # ── caches ────────────────────────────────────────────────────────────────────
 
 _ohlcv_1h: list[dict] = []
+_eth_oi_1h: list[dict] = []
+_cache_1h_hour: int = -1   # UTC-час, для которого закэшированы 1h-данные
 
 
 async def _main_loop(engine, fetcher: BybitFetcher, cfg, notifier: Notifier) -> None:
-    global _ohlcv_1h
+    global _ohlcv_1h, _eth_oi_1h, _cache_1h_hour
 
     while True:
         wait = _seconds_to_next_5m()
@@ -197,15 +199,21 @@ async def _main_loop(engine, fetcher: BybitFetcher, cfg, notifier: Notifier) -> 
             if still_open:
                 continue
 
-            # Fetch data — 0.5s between calls to avoid anonymous rate limit
+            # 5m-данные тянем каждый цикл (0.5s между вызовами)
             eth_5m  = fetcher.get_ohlcv(cfg.symbol, "5m", 60)
             await asyncio.sleep(0.5)
             btc_5m  = fetcher.get_ohlcv("BTCUSDT",  "5m", 60)
             await asyncio.sleep(0.5)
-            eth_oi  = fetcher.get_oi_history(cfg.symbol, "1h", 50)
-            await asyncio.sleep(0.5)
-            _ohlcv_1h = fetcher.get_ohlcv(cfg.symbol, "1h", 50) or _ohlcv_1h
-            await asyncio.sleep(0.5)
+
+            # 1h-данные (OHLCV 1h + OI history) меняются раз в час → кэшируем по UTC-часу
+            cur_hour = datetime.now(timezone.utc).hour
+            if cur_hour != _cache_1h_hour or not _ohlcv_1h:
+                _eth_oi_1h = fetcher.get_oi_history(cfg.symbol, "1h", 50) or _eth_oi_1h
+                await asyncio.sleep(0.5)
+                _ohlcv_1h = fetcher.get_ohlcv(cfg.symbol, "1h", 50) or _ohlcv_1h
+                await asyncio.sleep(0.5)
+                _cache_1h_hour = cur_hour
+            eth_oi = _eth_oi_1h
 
             # Existing funding position direction (for mutex)
             fund_data = fetcher.get_funding_rate(cfg.symbol)

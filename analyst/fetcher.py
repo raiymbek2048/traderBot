@@ -32,6 +32,7 @@ class BybitFetcher:
         self._exchange = ccxt.bybit({
             "apiKey": api_key,
             "secret": api_secret,
+            "enableRateLimit": True,   # ccxt сам выдерживает паузы между запросами
             "options": {"defaultType": "linear"},
         })
         if testnet:
