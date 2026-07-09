@@ -27,7 +27,7 @@ async def main() -> None:
 
     logger.remove()
     logger.add(sys.stderr, level="INFO")
-    logger.add("logs/funding.log", rotation="50 MB", retention="90 days")
+    # файл пишет systemd (StandardOutput=append), отдельный sink не нужен
 
     paper      = cfg.paper_trading
     size_usdt  = float(os.environ.get("FUNDING_SIZE_USDT", "50.0"))
