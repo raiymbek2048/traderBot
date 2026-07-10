@@ -215,9 +215,8 @@ async def _main_loop(engine, fetcher: BybitFetcher, cfg, notifier: Notifier) -> 
                 _cache_1h_hour = cur_hour
             eth_oi = _eth_oi_1h
 
-            # Existing funding position direction (for mutex)
-            fund_data = fetcher.get_funding_rate(cfg.symbol)
-            funding_rate = fund_data["current_rate"]
+            # Existing funding position direction (for mutex) — лёгкий 1 запрос
+            funding_rate = fetcher.get_funding_rate_light(cfg.symbol)
             funding_dir = None
             if abs(funding_rate) >= cfg.funding_threshold:
                 funding_dir = "short" if funding_rate > 0 else "long"

@@ -91,6 +91,18 @@ class BybitFetcher:
             "history": history,
         }
 
+    def get_funding_rate_light(self, symbol: str) -> float:
+        """Только текущий funding rate одним прямым запросом (для momentum-mutex).
+
+        Заменяет тяжёлый get_funding_rate() (3 вызова ccxt) → 1 httpx-вызов.
+        """
+        raw = _fetch_ticker_direct(symbol)
+        if raw:
+            fr = raw.get("fundingRate")
+            if fr:
+                return float(fr)
+        return 0.0
+
     def get_ohlcv(self, symbol: str, timeframe: str = "4h", limit: int = 100) -> list[dict]:
         raw = self._exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         return [
