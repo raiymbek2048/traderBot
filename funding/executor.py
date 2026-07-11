@@ -203,14 +203,16 @@ async def open_position(
             logger.warning(f"qty=0 для {symbol}, пропускаем")
             return None
 
-        balance = bybit.get_spot_balance()
-        if balance < size_usdt * 2:  # нужен спот + маржа перпа
-            await _send_tg(
-                f"⚠️ Недостаточно баланса для {symbol}\n"
-                f"Нужно: ${size_usdt*2:.0f}, есть: ${balance:.2f}"
-            )
-            logger.warning(f"Insufficient balance: need ${size_usdt*2:.0f}, have ${balance:.2f}")
-            return None
+        # Проверка баланса — только для реальной торговли. В paper симулируем.
+        if not paper:
+            balance = bybit.get_spot_balance()
+            if balance < size_usdt * 2:  # нужен спот + маржа перпа
+                await _send_tg(
+                    f"⚠️ Недостаточно баланса для {symbol}\n"
+                    f"Нужно: ${size_usdt*2:.0f}, есть: ${balance:.2f}"
+                )
+                logger.warning(f"Insufficient balance: need ${size_usdt*2:.0f}, have ${balance:.2f}")
+                return None
 
         logger.info(
             f"Opening position: {symbol} | price={price} | qty={qty} | "
