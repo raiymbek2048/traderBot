@@ -28,6 +28,9 @@ SIZE_USDT      = float(10)   # переопределяется из env в run.
 PERP_LEVERAGE  = 1           # 1x — без плеча, безопасно
 PAPER_TRADING  = True        # переопределяется из run.py
 
+# Комиссии полного цикла (вход+выход): спот taker 0.1%×2 + перп taker 0.055%×2
+FEE_ROUNDTRIP_PCT = 0.0031   # ≈0.31% от size — вычитается из PnL и в paper
+
 _tg_token: str = ""
 _tg_chat:  str = ""
 
@@ -326,24 +329,27 @@ async def close_position(
                 raise RuntimeError(f"Perp close failed: {perp_res}")
 
         # PnL от спота и перпа взаимно компенсируются (delta neutral)
-        # Реальная прибыль = funding_collected
+        # Честный PnL = собранный фандинг − комиссии полного цикла (и в paper!)
         with Session(engine) as session:
             pos = session.get(FundingPosition, position_id)
             pos.spot_exit_price = exit_price
             pos.perp_exit_price = exit_price
             pos.funding_rate_close = 0.0
-            pos.pnl_usdt = pos.funding_collected_usdt
+            fees = round(pos.size_usdt * FEE_ROUNDTRIP_PCT, 4)
+            pos.pnl_usdt = round((pos.funding_collected_usdt or 0.0) - fees, 4)
             pos.status = "closed"
             pos.closed_at = datetime.now(timezone.utc)
             session.commit()
             collected = pos.funding_collected_usdt
+            pnl = pos.pnl_usdt
 
         mode = "PAPER" if paper else "LIVE"
         await _send_tg(
             f"🔒 [{mode}] Позиция закрыта\n"
             f"Символ: {symbol}\n"
             f"Вход: ${entry_price:.4f} → Выход: ${exit_price:.4f}\n"
-            f"Фандинг собрано: ${collected:.4f}\n"
+            f"Фандинг собрано: ${collected:.4f} | комиссии: −${fees:.4f}\n"
+            f"PnL: {'+' if pnl >= 0 else ''}${pnl:.4f}\n"
             f"ID: {position_id}"
         )
         logger.info(f"Position closed: id={position_id} {symbol}, funding=${collected:.4f}")

@@ -19,6 +19,12 @@ ENTRY_THRESHOLD = 0.0005   # 0.05% per 8h — входим (положитель
 EXIT_THRESHOLD  = 0.0001   # 0.01% per 8h — выходим
 MAX_POSITIONS   = 5        # макс. одновременных позиций (под реальный капитал)
 
+# Анти-churn: фандинг мелькает → раньше вход/выход крутились с нулём собранного
+# (в реале это −0.31% комиссий за цикл). Теперь:
+ENTRY_CONFIRM   = 10       # фандинг ≥ порога N проверок подряд (N минут)
+EXIT_CONFIRM    = 10       # ниже exit-порога N проверок подряд
+ENTRY_WINDOW_H  = 3.0      # входим только если до сеттлмента ≤ этого (часов)
+
 CHECK_INTERVAL     = 60       # секунд между проверками фандинга
 SPOT_REFRESH_SEC   = 3600     # как часто обновлять список спот-пар
 
@@ -30,6 +36,10 @@ _tg_chat:  str = ""
 # кэш спот-вселенной (для проверки что есть чем хеджить)
 _spot_symbols: set[str] = set()
 _spot_ts: float = 0.0
+
+# счётчики устойчивости фандинга (анти-churn)
+_above_streak: dict[str, int] = {}   # symbol → подряд циклов ≥ ENTRY_THRESHOLD
+_below_streak: dict[str, int] = {}   # symbol → подряд циклов < EXIT_THRESHOLD
 
 
 def _fetch_all_funding() -> dict[str, float]:
@@ -106,10 +116,26 @@ async def rate_monitor(open_positions: dict[str, int]) -> None:
             )
             now = datetime.now(timezone.utc).strftime("%H:%M:%S")
 
-            # кандидаты: положительный фандинг ≥ порога И есть спот для хеджа
+            # обновляем счётчики устойчивости
+            for s, r in rates.items():
+                if r >= ENTRY_THRESHOLD and s in spot:
+                    _above_streak[s] = _above_streak.get(s, 0) + 1
+                else:
+                    _above_streak.pop(s, None)
+                if r < EXIT_THRESHOLD:
+                    _below_streak[s] = _below_streak.get(s, 0) + 1
+                else:
+                    _below_streak.pop(s, None)
+
+            # до сеттлмента (входим только в окне перед начислением)
+            from funding.executor import _seconds_to_next_settlement
+            hours_to_settle = _seconds_to_next_settlement() / 3600
+            in_window = hours_to_settle <= ENTRY_WINDOW_H
+
+            # кандидаты: фандинг устойчив ENTRY_CONFIRM циклов И окно сеттлмента
             candidates = sorted(
                 ((s, r) for s, r in rates.items()
-                 if r >= ENTRY_THRESHOLD and s in spot),
+                 if _above_streak.get(s, 0) >= ENTRY_CONFIRM and in_window),
                 key=lambda x: -x[1],
             )
 
@@ -118,13 +144,14 @@ async def rate_monitor(open_positions: dict[str, int]) -> None:
             top_lines = [f"  {s}: {r*100:.4f}%/8h ({r*3*365*100:.0f}%/год)"
                          + ("  ✅спот" if s in spot else "  ⛔нет спота")
                          for s, r in top]
-            logger.info(f"[{now}] перпов={len(rates)} | кандидатов≥порога={len(candidates)} | "
-                        f"открыто={len(open_positions)}\nТоп фандинга:\n" + "\n".join(top_lines))
+            logger.info(f"[{now}] перпов={len(rates)} | кандидатов={len(candidates)} | "
+                        f"открыто={len(open_positions)} | до сеттлмента {hours_to_settle:.1f}ч"
+                        f"{' (окно входа)' if in_window else ''}\nТоп фандинга:\n" + "\n".join(top_lines))
 
-            # ── ЗАКРЫТИЕ: открытые позиции где фандинг упал ──
+            # ── ЗАКРЫТИЕ: фандинг устойчиво ниже exit-порога ──
             for sym in list(open_positions.keys()):
-                fr = rates.get(sym, 0.0)
-                if fr < EXIT_THRESHOLD:
+                if _below_streak.get(sym, 0) >= EXIT_CONFIRM:
+                    fr = rates.get(sym, 0.0)
                     pos_id = open_positions[sym]
                     logger.info(f"EXIT signal: {sym} funding={fr*100:.4f}% (pos_id={pos_id})")
                     await _send_tg(
