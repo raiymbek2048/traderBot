@@ -185,6 +185,19 @@ _eth_oi_1h: list[dict] = []
 _cache_1h_hour: int = -1   # UTC-час, для которого закэшированы 1h-данные
 
 
+async def _rl_retry(fn, *args, tries: int = 3, base: float = 1.5, **kwargs):
+    """Вызывает fn с retry при Bybit rate-limit (10006). Backoff 1.5s, 3s."""
+    for i in range(tries):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            msg = str(e)
+            if ("10006" in msg or "Rate Limit" in msg) and i < tries - 1:
+                await asyncio.sleep(base * (i + 1))
+                continue
+            raise
+
+
 async def _main_loop(engine, fetcher: BybitFetcher, cfg, notifier: Notifier) -> None:
     global _ohlcv_1h, _eth_oi_1h, _cache_1h_hour
 
@@ -199,24 +212,24 @@ async def _main_loop(engine, fetcher: BybitFetcher, cfg, notifier: Notifier) -> 
             if still_open:
                 continue
 
-            # 5m-данные тянем каждый цикл (0.5s между вызовами)
-            eth_5m  = fetcher.get_ohlcv(cfg.symbol, "5m", 60)
+            # 5m-данные тянем каждый цикл (retry при rate-limit, 0.5s между вызовами)
+            eth_5m  = await _rl_retry(fetcher.get_ohlcv, cfg.symbol, "5m", 60)
             await asyncio.sleep(0.5)
-            btc_5m  = fetcher.get_ohlcv("BTCUSDT",  "5m", 60)
+            btc_5m  = await _rl_retry(fetcher.get_ohlcv, "BTCUSDT", "5m", 60)
             await asyncio.sleep(0.5)
 
             # 1h-данные (OHLCV 1h + OI history) меняются раз в час → кэшируем по UTC-часу
             cur_hour = datetime.now(timezone.utc).hour
             if cur_hour != _cache_1h_hour or not _ohlcv_1h:
-                _eth_oi_1h = fetcher.get_oi_history(cfg.symbol, "1h", 50) or _eth_oi_1h
+                _eth_oi_1h = await _rl_retry(fetcher.get_oi_history, cfg.symbol, "1h", 50) or _eth_oi_1h
                 await asyncio.sleep(0.5)
-                _ohlcv_1h = fetcher.get_ohlcv(cfg.symbol, "1h", 50) or _ohlcv_1h
+                _ohlcv_1h = await _rl_retry(fetcher.get_ohlcv, cfg.symbol, "1h", 50) or _ohlcv_1h
                 await asyncio.sleep(0.5)
                 _cache_1h_hour = cur_hour
             eth_oi = _eth_oi_1h
 
             # Existing funding position direction (for mutex) — лёгкий 1 запрос
-            funding_rate = fetcher.get_funding_rate_light(cfg.symbol)
+            funding_rate = await _rl_retry(fetcher.get_funding_rate_light, cfg.symbol)
             funding_dir = None
             if abs(funding_rate) >= cfg.funding_threshold:
                 funding_dir = "short" if funding_rate > 0 else "long"
