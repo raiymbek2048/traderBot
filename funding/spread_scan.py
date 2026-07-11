@@ -86,21 +86,25 @@ def scan_once() -> list[dict]:
     """Возвращает спреды по общим перпам, отсортированные по |спреду|."""
     by = _get("https://api.bybit.com/v5/market/tickers?category=linear")
     by_fr: dict[str, float] = {}
+    by_px: dict[str, float] = {}
     for it in by["result"]["list"]:
         s, fr = it.get("symbol", ""), it.get("fundingRate", "")
         if s.endswith("USDT") and fr:
             try:
                 by_fr[s] = float(fr)
+                by_px[s] = float(it.get("lastPrice", 0))
             except ValueError:
                 pass
 
     bn = _get("https://fapi.binance.com/fapi/v1/premiumIndex")
     bn_fr: dict[str, float] = {}
+    bn_px: dict[str, float] = {}
     for it in bn:
         s, fr = it.get("symbol", ""), it.get("lastFundingRate", "")
         if s.endswith("USDT") and fr:
             try:
                 bn_fr[s] = float(fr)
+                bn_px[s] = float(it.get("markPrice", 0))
             except ValueError:
                 pass
 
@@ -109,12 +113,16 @@ def scan_once() -> list[dict]:
     for s in set(by_fr) & set(bn_fr):
         by_daily = by_fr[s] * (1440 / intervals.get(s, 480))
         bn_daily = bn_fr[s] * 3  # Binance стандарт 8h (искл. редки — огрубляем)
+        bp, np_ = by_px.get(s, 0), bn_px.get(s, 0)
+        gap = round((bp - np_) / np_ * 100, 4) if np_ else None
         rows.append({
             "symbol": s,
             "bybit_fr": by_fr[s], "binance_fr": bn_fr[s],
             "bybit_daily_pct": round(by_daily * 100, 4),
             "binance_daily_pct": round(bn_daily * 100, 4),
             "spread_daily_pct": round((by_daily - bn_daily) * 100, 4),
+            "bybit_price": bp, "binance_price": np_,
+            "price_gap_pct": gap,
         })
     rows.sort(key=lambda r: -abs(r["spread_daily_pct"]))
     return rows
@@ -159,14 +167,22 @@ async def main() -> None:
                     continue
                 _last_alert[sym] = time.time()
                 # положительный спред: шорт Bybit + лонг Binance; отрицательный — наоборот
+                gap = r["price_gap_pct"] or 0.0
                 if sp > 0:
                     plan = "SHORT Bybit + LONG Binance"
+                    entry_edge = gap        # шортим дорогую ногу → конвергенция в плюс
                 else:
                     plan = "LONG Bybit + SHORT Binance"
+                    entry_edge = -gap
+                fees = 0.21  # перп-тейкер ~0.05%×4 сделки (вход+выход обеих ног)
+                cost = fees + max(0.0, -entry_edge)
+                be_hours = cost / abs(sp) * 24 if sp else 0
                 _tg(
                     f"🔀 Funding Spread ≥{ALERT_DAILY_PCT}%/день\n"
                     f"{sym}: {sp:+.3f}%/день (≈{sp*365:+.0f}%/год)\n"
                     f"Bybit {r['bybit_daily_pct']:+.2f}%/д | Binance {r['binance_daily_pct']:+.2f}%/д\n"
+                    f"Δцен перпов: {gap:+.2f}% (вход {'помогает' if entry_edge > 0 else 'стоит'} {abs(entry_edge):.2f}%)\n"
+                    f"Break-even ≈ {be_hours:.1f}ч удержания (комиссии+вход)\n"
                     f"Delta-neutral: {plan}"
                 )
         except Exception as e:

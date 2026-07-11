@@ -204,6 +204,9 @@ class FundingSpreadSnap(Base):
     bybit_daily_pct = Column(Float)  # нормализовано %/день
     binance_daily_pct = Column(Float)
     spread_daily_pct = Column(Float) # bybit - binance, %/день
+    bybit_price = Column(Float)      # lastPrice перпа
+    binance_price = Column(Float)
+    price_gap_pct = Column(Float)    # (bybit-binance)/binance*100 — цена входа в сделку
     ts = Column(DateTime, nullable=False)
 
 
@@ -220,19 +223,29 @@ class LiqEvent(Base):
 
 
 def _migrate_arb_paper(engine) -> None:
-    """Добавляет новые колонки realism v2 в существующую таблицу (SQLite ALTER)."""
+    """Добавляет новые колонки в существующие таблицы (SQLite ALTER)."""
     from sqlalchemy import text
-    new_cols = {
-        "naive_gross_pct": "FLOAT",
-        "naive_net_pct": "FLOAT",
-        "slippage_pct": "FLOAT",
-        "fillable": "BOOLEAN",
+    migrations = {
+        "arb_paper_trades": {
+            "naive_gross_pct": "FLOAT",
+            "naive_net_pct": "FLOAT",
+            "slippage_pct": "FLOAT",
+            "fillable": "BOOLEAN",
+        },
+        "funding_spread_snaps": {
+            "bybit_price": "FLOAT",
+            "binance_price": "FLOAT",
+            "price_gap_pct": "FLOAT",
+        },
     }
     with engine.begin() as conn:
-        existing = {row[1] for row in conn.execute(text("PRAGMA table_info(arb_paper_trades)"))}
-        for col, typ in new_cols.items():
-            if col not in existing:
-                conn.execute(text(f"ALTER TABLE arb_paper_trades ADD COLUMN {col} {typ}"))
+        for table, cols in migrations.items():
+            existing = {row[1] for row in conn.execute(text(f"PRAGMA table_info({table})"))}
+            if not existing:
+                continue  # таблицы ещё нет — create_all создаст с полной схемой
+            for col, typ in cols.items():
+                if col not in existing:
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {typ}"))
 
 
 def init_db(database_url: str):
