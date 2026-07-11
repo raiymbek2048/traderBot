@@ -194,6 +194,31 @@ def get_engine(database_url: str):
     return create_engine(database_url, echo=False)
 
 
+class FundingSpreadSnap(Base):
+    """Снимок спреда фандинга Bybit vs Binance (нормализовано в %/день)."""
+    __tablename__ = "funding_spread_snaps"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    symbol = Column(String(24), nullable=False)
+    bybit_fr = Column(Float)         # raw за интервал
+    binance_fr = Column(Float)
+    bybit_daily_pct = Column(Float)  # нормализовано %/день
+    binance_daily_pct = Column(Float)
+    spread_daily_pct = Column(Float) # bybit - binance, %/день
+    ts = Column(DateTime, nullable=False)
+
+
+class LiqEvent(Base):
+    """Ликвидация с Bybit WS (allLiquidation) — для анализа каскадов/отскоков."""
+    __tablename__ = "liq_events"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    symbol = Column(String(24), nullable=False)
+    side = Column(String(8))         # Buy = ликвидирован шорт, Sell = ликвидирован лонг
+    qty = Column(Float)
+    price = Column(Float)
+    value_usdt = Column(Float)       # qty * price
+    ts = Column(DateTime, nullable=False)
+
+
 def _migrate_arb_paper(engine) -> None:
     """Добавляет новые колонки realism v2 в существующую таблицу (SQLite ALTER)."""
     from sqlalchemy import text
