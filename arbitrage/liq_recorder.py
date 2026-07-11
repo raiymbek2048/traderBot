@@ -68,8 +68,25 @@ async def recorder(engine, symbols: list[str]) -> None:
                     }))
                     await asyncio.sleep(0.2)
                 backoff = 2
+                silent = 0
                 while True:
-                    raw = await asyncio.wait_for(ws.recv(), timeout=WS_SILENCE_SEC)
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=20)
+                    except asyncio.TimeoutError:
+                        # тихо (ликвидаций нет) — Bybit-heartbeat вместо реконнекта
+                        silent += 1
+                        if silent > 4:   # >80с без ответа даже на ping — реконнект
+                            raise RuntimeError("no pong, forcing reconnect")
+                        await ws.send(json.dumps({"op": "ping"}))
+                        # заодно сбрасываем накопленное в БД
+                        if pending:
+                            with Session(engine) as session:
+                                session.add_all(pending)
+                                session.commit()
+                            total += len(pending)
+                            pending.clear()
+                        continue
+                    silent = 0
                     m = json.loads(raw)
                     topic = m.get("topic", "")
                     if not topic.startswith("allLiquidation"):
@@ -95,15 +112,6 @@ async def recorder(engine, symbols: list[str]) -> None:
                             session.commit()
                         total += len(pending)
                         pending.clear()
-        except asyncio.TimeoutError:
-            # тишина = ликвидаций нет; сбросим накопленное и переподключимся
-            if pending:
-                with Session(engine) as session:
-                    session.add_all(pending)
-                    session.commit()
-                total += len(pending)
-                pending.clear()
-            logger.debug("WS тихо (нет ликвидаций) — reconnect")
         except Exception as e:
             logger.warning(f"WS error: {e}. Reconnect in {backoff}s")
             await asyncio.sleep(backoff)
