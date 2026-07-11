@@ -162,7 +162,11 @@ async def _send_tg(msg: str) -> None:
 
 
 def _round_qty(qty: float, symbol: str) -> float:
-    """Минимальные шаги количества по символу."""
+    """Минимальные шаги количества по символу.
+
+    Для известных мажоров — точный шаг. Для произвольных токенов (скан-режим)
+    шаг зависит от величины qty, чтобы не обнулить дорогие монеты.
+    """
     steps = {
         "BTCUSDT": 0.001,
         "ETHUSDT": 0.01,
@@ -171,8 +175,13 @@ def _round_qty(qty: float, symbol: str) -> float:
         "BNBUSDT": 0.01,
         "XRPUSDT": 1.0,
     }
-    step = steps.get(symbol, 1.0)
-    return round(int(qty / step) * step, 8)
+    if symbol in steps:
+        step = steps[symbol]
+        return round(int(qty / step) * step, 8)
+    # произвольный токен: адаптивная точность по величине qty
+    if qty >= 1000:   return float(int(qty))
+    if qty >= 1:      return round(qty, 2)
+    return round(qty, 6)
 
 
 async def open_position(
