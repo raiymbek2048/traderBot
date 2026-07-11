@@ -28,8 +28,27 @@ SIZE_USDT      = float(10)   # переопределяется из env в run.
 PERP_LEVERAGE  = 1           # 1x — без плеча, безопасно
 PAPER_TRADING  = True        # переопределяется из run.py
 
-# Комиссии полного цикла (вход+выход): спот taker 0.1%×2 + перп taker 0.055%×2
-FEE_ROUNDTRIP_PCT = 0.0031   # ≈0.31% от size — вычитается из PnL и в paper
+# Дефолтные комиссии полного цикла (вход+выход): спот taker 0.1%×2 + перп taker 0.055%×2
+# Реальные ставки по символу (Innovation/Adventure zone могут быть ×2!) тянутся из API.
+FEE_ROUNDTRIP_PCT = 0.0031   # fallback если API недоступен
+
+_fee_cache: dict[str, float] = {}   # symbol → roundtrip-доля (spot_taker*2 + perp_taker*2)
+
+
+def _symbol_fees_usdt(bybit: "BybitClient", symbol: str, notional: float) -> float:
+    """Комиссии полного цикла в USDT по РЕАЛЬНЫМ ставкам символа (кэш в памяти)."""
+    if symbol not in _fee_cache:
+        try:
+            _, spot_taker = bybit.get_fee_rates(symbol, "spot")
+            _, perp_taker = bybit.get_fee_rates(symbol, "linear")
+            _fee_cache[symbol] = 2 * spot_taker + 2 * perp_taker
+            if _fee_cache[symbol] > FEE_ROUNDTRIP_PCT * 1.5:
+                logger.warning(f"{symbol}: повышенные комиссии (зона?) "
+                               f"roundtrip={_fee_cache[symbol]*100:.3f}%")
+        except Exception as e:
+            logger.warning(f"fee-rate API failed for {symbol}: {e}, fallback 0.31%")
+            _fee_cache[symbol] = FEE_ROUNDTRIP_PCT
+    return notional * _fee_cache[symbol]
 
 _tg_token: str = ""
 _tg_chat:  str = ""
@@ -84,6 +103,32 @@ class BybitClient:
     def get_ticker(self, symbol: str, category: str = "spot") -> dict:
         data = self._get("/v5/market/tickers", f"category={category}&symbol={symbol}")
         return data["result"]["list"][0]
+
+    def get_fee_rates(self, symbol: str, category: str) -> tuple[float, float]:
+        """(maker, taker) для символа — реальные ставки аккаунта (учитывают зоны)."""
+        data = self._get("/v5/account/fee-rate", f"category={category}&symbol={symbol}")
+        row = data["result"]["list"][0]
+        return float(row["makerFeeRate"]), float(row["takerFeeRate"])
+
+    def get_settled_fundings(self, symbol: str, since_ms: int) -> list[tuple[int, float]]:
+        """Фактически НАЧИСЛЕННЫЕ ставки с момента since_ms: [(ts_ms, rate), ...].
+
+        NB: startTime без endTime у Bybit возвращает пусто — фильтруем на клиенте.
+        limit=200 покрывает 66 дней при 8ч-интервале.
+        """
+        data = self._get(
+            "/v5/market/funding/history",
+            f"category=linear&symbol={symbol}&limit=200",
+        )
+        out = []
+        for row in data.get("result", {}).get("list", []):
+            try:
+                ts = int(row["fundingRateTimestamp"])
+                if ts >= since_ms:
+                    out.append((ts, float(row["fundingRate"])))
+            except (KeyError, ValueError):
+                continue
+        return out
 
     def set_leverage(self, symbol: str, leverage: int) -> None:
         body = {
@@ -197,9 +242,13 @@ async def open_position(
 ) -> int | None:
     """Открыть delta-neutral позицию. Возвращает position_id или None при ошибке."""
     try:
-        # Текущая цена
-        ticker = bybit.get_ticker(symbol, "spot")
-        price = float(ticker["lastPrice"])
+        # Честные цены входа (taker): спот покупаем по ask, перп шортим по bid.
+        # Ноги записываются РАЗДЕЛЬНО — basis между спотом и перпом теперь в PnL.
+        spot_t = bybit.get_ticker(symbol, "spot")
+        perp_t = bybit.get_ticker(symbol, "linear")
+        spot_entry = float(spot_t.get("ask1Price") or spot_t["lastPrice"])
+        perp_entry = float(perp_t.get("bid1Price") or perp_t["lastPrice"])
+        price = spot_entry
         qty = _round_qty(size_usdt / price, symbol)
 
         if qty <= 0:
@@ -261,8 +310,8 @@ async def open_position(
                 size_usdt=size_usdt,
                 spot_qty=qty,
                 perp_qty=qty,
-                spot_entry_price=price,
-                perp_entry_price=price,
+                spot_entry_price=spot_entry,
+                perp_entry_price=perp_entry,
                 funding_rate_open=funding_rate,
                 funding_collected_usdt=0.0,
                 status="open",
@@ -275,11 +324,13 @@ async def open_position(
 
         mode = "PAPER" if paper else "LIVE"
         annualized = funding_rate * 3 * 365 * 100
+        entry_basis = (perp_entry - spot_entry) / spot_entry * 100
         await _send_tg(
             f"✅ [{mode}] Позиция открыта\n"
             f"Символ: {symbol}\n"
-            f"Спот BUY: {qty} @ ${price:.4f}\n"
-            f"Перп SHORT: {qty} @ ${price:.4f}\n"
+            f"Спот BUY: {qty} @ ${spot_entry:.6f} (ask)\n"
+            f"Перп SHORT: {qty} @ ${perp_entry:.6f} (bid)\n"
+            f"Basis на входе: {entry_basis:+.3f}%\n"
             f"Размер: ${size_usdt}\n"
             f"Фандинг: {funding_rate*100:.4f}%/8h ({annualized:.1f}%/год)\n"
             f"ID: {pos_id}"
@@ -309,10 +360,14 @@ async def close_position(
                 return
 
             qty = pos.spot_qty
-            entry_price = pos.spot_entry_price
+            spot_entry = pos.spot_entry_price
+            perp_entry = pos.perp_entry_price or spot_entry
 
-        ticker = bybit.get_ticker(symbol, "spot")
-        exit_price = float(ticker["lastPrice"])
+        # Честные цены выхода (taker): спот продаём по bid, перп выкупаем по ask
+        spot_t = bybit.get_ticker(symbol, "spot")
+        perp_t = bybit.get_ticker(symbol, "linear")
+        spot_exit = float(spot_t.get("bid1Price") or spot_t["lastPrice"])
+        perp_exit = float(perp_t.get("ask1Price") or perp_t["lastPrice"])
 
         if not paper:
             spot_res, perp_res = await asyncio.gather(
@@ -328,31 +383,38 @@ async def close_position(
             if perp_res.get("retCode") != 0:
                 raise RuntimeError(f"Perp close failed: {perp_res}")
 
-        # PnL от спота и перпа взаимно компенсируются (delta neutral)
-        # Честный PnL = собранный фандинг − комиссии полного цикла (и в paper!)
+        # ПОЛНЫЙ PnL = ноги (basis) + собранный фандинг − комиссии (per-symbol)
+        # spot leg:  qty × (exit − entry);  perp short leg:  qty × (entry − exit)
+        spot_leg = qty * (spot_exit - spot_entry)
+        perp_leg = qty * (perp_entry - perp_exit)
+        basis_pnl = round(spot_leg + perp_leg, 4)
+        fees = round(_symbol_fees_usdt(bybit, symbol, pos_size := qty * spot_entry), 4)
+
         with Session(engine) as session:
             pos = session.get(FundingPosition, position_id)
-            pos.spot_exit_price = exit_price
-            pos.perp_exit_price = exit_price
+            pos.spot_exit_price = spot_exit
+            pos.perp_exit_price = perp_exit
             pos.funding_rate_close = 0.0
-            fees = round(pos.size_usdt * FEE_ROUNDTRIP_PCT, 4)
-            pos.pnl_usdt = round((pos.funding_collected_usdt or 0.0) - fees, 4)
+            pos.basis_pnl_usdt = basis_pnl
+            pos.fees_usdt = fees
+            pos.pnl_usdt = round(basis_pnl + (pos.funding_collected_usdt or 0.0) - fees, 4)
             pos.status = "closed"
             pos.closed_at = datetime.now(timezone.utc)
             session.commit()
-            collected = pos.funding_collected_usdt
+            collected = pos.funding_collected_usdt or 0.0
             pnl = pos.pnl_usdt
 
         mode = "PAPER" if paper else "LIVE"
         await _send_tg(
             f"🔒 [{mode}] Позиция закрыта\n"
             f"Символ: {symbol}\n"
-            f"Вход: ${entry_price:.4f} → Выход: ${exit_price:.4f}\n"
-            f"Фандинг собрано: ${collected:.4f} | комиссии: −${fees:.4f}\n"
+            f"Спот: ${spot_entry:.6f}→${spot_exit:.6f} | Перп: ${perp_entry:.6f}→${perp_exit:.6f}\n"
+            f"Basis PnL: {basis_pnl:+.4f} | Фандинг: +{collected:.4f} | Комиссии: −{fees:.4f}\n"
             f"PnL: {'+' if pnl >= 0 else ''}${pnl:.4f}\n"
             f"ID: {position_id}"
         )
-        logger.info(f"Position closed: id={position_id} {symbol}, funding=${collected:.4f}")
+        logger.info(f"Position closed: id={position_id} {symbol} basis={basis_pnl:+.4f} "
+                    f"funding={collected:.4f} fees={fees:.4f} pnl={pnl:+.4f}")
 
     except Exception as e:
         logger.error(f"close_position error: {e}")
@@ -411,46 +473,60 @@ def _seconds_to_next_settlement() -> float:
     return (nxt - now).total_seconds()
 
 
-async def accrual_loop(engine, open_positions: dict[str, int]) -> None:
-    """Каждые 8ч (в момент сеттлмента) начисляет фандинг на открытые позиции.
+async def accrual_loop(engine, open_positions: dict[str, int],
+                       bybit: "BybitClient | None" = None) -> None:
+    """Пересчитывает собранный фандинг по ФАКТИЧЕСКИ начисленным ставкам.
 
-    Мы SHORT перп: при funding_rate > 0 шорты ПОЛУЧАЮТ выплату от лонгов.
-    collected += funding_rate * notional.
+    Раз в 30 мин: для каждой открытой позиции тянем /v5/market/funding/history
+    с момента открытия и пересчитываем collected = size × Σ settled_rates.
+    Идемпотентно (не важно сколько раз пересчитали), корректно для любых
+    интервалов фандинга (1/2/4/8ч) и не зависит от «предсказанной» ставки тикера.
+    Мы SHORT перп: fr>0 — получаем, fr<0 — платим.
     """
     from datetime import datetime, timezone
+    from sqlalchemy import select
+    CHECK = 1800  # 30 мин
     while True:
-        wait = _seconds_to_next_settlement()
-        logger.info(f"[accrual] следующий сеттлмент через {wait/3600:.2f}ч")
-        await asyncio.sleep(wait + 5)  # +5с чтобы биржа успела зафиксировать
         try:
-            rates = await asyncio.get_event_loop().run_in_executor(None, _fetch_funding_rates)
+            with Session(engine) as session:
+                positions = session.execute(
+                    select(FundingPosition).where(FundingPosition.status == "open")
+                ).scalars().all()
+                changes = []
+                for pos in positions:
+                    if bybit is None:
+                        break
+                    opened_ms = int(pos.opened_at.replace(
+                        tzinfo=timezone.utc).timestamp() * 1000)
+                    try:
+                        settles = await asyncio.get_event_loop().run_in_executor(
+                            None, lambda s=pos.symbol, m=opened_ms:
+                            bybit.get_settled_fundings(s, m))
+                    except Exception as e:
+                        logger.warning(f"[accrual] history failed {pos.symbol}: {e}")
+                        continue
+                    new_collected = round(
+                        pos.size_usdt * sum(r for _, r in settles), 6)
+                    old = pos.funding_collected_usdt or 0.0
+                    if abs(new_collected - old) > 1e-9:
+                        pos.funding_collected_usdt = new_collected
+                        changes.append(
+                            (pos.symbol, len(settles), new_collected - old, new_collected))
+                session.commit()
+
+            for sym, n, delta, total in changes:
+                logger.info(f"[accrual] {sym}: {n} сеттлментов, Δ{delta:+.4f} "
+                            f"→ всего {total:+.4f} USDT")
+            if changes:
+                ts = datetime.now(timezone.utc).strftime("%H:%M UTC")
+                await _send_tg(
+                    f"💰 Фандинг начислен ({ts}, settled-ставки)\n" +
+                    "\n".join(f"  {s}: {d:+.4f} (всего {t:+.4f})"
+                              for s, n, d, t in changes)
+                )
         except Exception as e:
-            logger.warning(f"[accrual] не смог получить рейты: {e}")
-            continue
-        with Session(engine) as session:
-            from sqlalchemy import select
-            positions = session.execute(
-                select(FundingPosition).where(FundingPosition.status == "open")
-            ).scalars().all()
-            total_payment = 0.0
-            for pos in positions:
-                fr = rates.get(pos.symbol)
-                if fr is None:
-                    continue
-                # шорт получает fr * notional при fr>0 (и платит при fr<0)
-                payment = fr * pos.size_usdt
-                pos.funding_collected_usdt = (pos.funding_collected_usdt or 0.0) + payment
-                total_payment += payment
-                logger.info(f"[accrual] {pos.symbol}: fr={fr*100:.4f}% → {payment:+.4f} USDT "
-                            f"(всего {pos.funding_collected_usdt:+.4f})")
-            session.commit()
-        if positions:
-            ts = datetime.now(timezone.utc).strftime("%H:%M UTC")
-            await _send_tg(
-                f"💰 Фандинг начислен ({ts})\n"
-                f"Позиций: {len(positions)}\n"
-                f"Выплата за сеттлмент: {total_payment:+.4f} USDT"
-            )
+            logger.error(f"[accrual] loop error: {e}")
+        await asyncio.sleep(CHECK)
 
 
 async def run(engine, bybit: BybitClient, paper: bool, size_usdt: float,

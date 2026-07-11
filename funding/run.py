@@ -59,7 +59,7 @@ async def main() -> None:
         monitor.rate_monitor(open_positions),
         monitor.stats_printer(open_positions),
         executor.run(engine, bybit, paper, size_usdt, open_positions),
-        executor.accrual_loop(engine, open_positions),
+        executor.accrual_loop(engine, open_positions, bybit),
     )
 
 

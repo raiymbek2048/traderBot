@@ -181,8 +181,10 @@ class FundingPosition(Base):
     perp_exit_price = Column(Float)
     funding_rate_open = Column(Float)     # фандинг в момент открытия
     funding_rate_close = Column(Float)    # фандинг в момент закрытия
-    funding_collected_usdt = Column(Float, default=0.0)  # накоплено фандинга
-    pnl_usdt = Column(Float)             # итоговый PnL
+    funding_collected_usdt = Column(Float, default=0.0)  # накоплено фандинга (settled-ставки)
+    fees_usdt = Column(Float)            # комиссии полного цикла (per-symbol ставки)
+    basis_pnl_usdt = Column(Float)       # PnL ног: spot leg + perp leg (bid/ask)
+    pnl_usdt = Column(Float)             # итоговый PnL = basis + funding - fees
     status = Column(String(20), default="open")  # open / closed / failed
     error = Column(Text)
     paper = Column(Boolean, default=True)
@@ -206,7 +208,8 @@ class FundingSpreadSnap(Base):
     spread_daily_pct = Column(Float) # bybit - binance, %/день
     bybit_price = Column(Float)      # lastPrice перпа
     binance_price = Column(Float)
-    price_gap_pct = Column(Float)    # (bybit-binance)/binance*100 — цена входа в сделку
+    price_gap_pct = Column(Float)    # (bybit-binance)/binance*100 — по last/mark (справочно)
+    exec_edge_pct = Column(Float)    # исполнимый вход по bid/ask в направлении сделки (+= помогает)
     ts = Column(DateTime, nullable=False)
 
 
@@ -236,6 +239,11 @@ def _migrate_arb_paper(engine) -> None:
             "bybit_price": "FLOAT",
             "binance_price": "FLOAT",
             "price_gap_pct": "FLOAT",
+            "exec_edge_pct": "FLOAT",
+        },
+        "funding_positions": {
+            "fees_usdt": "FLOAT",
+            "basis_pnl_usdt": "FLOAT",
         },
     }
     with engine.begin() as conn:

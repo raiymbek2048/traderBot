@@ -42,6 +42,10 @@ _last_alert: dict[str, float] = {}
 _by_intervals: dict[str, int] = {}
 _by_int_ts = 0.0
 
+# интервалы фандинга Binance (часы) — исключения из стандартных 8ч
+_bn_intervals: dict[str, int] = {}
+_bn_int_ts = 0.0
+
 
 def _get(url: str) -> dict | list:
     with urllib.request.urlopen(url, timeout=15) as r:
@@ -82,17 +86,36 @@ def _bybit_intervals() -> dict[str, int]:
     return _by_intervals
 
 
+def _binance_intervals() -> dict[str, int]:
+    """Нестандартные интервалы фандинга Binance (часы). Стандарт = 8ч."""
+    global _bn_intervals, _bn_int_ts
+    if time.time() - _bn_int_ts > 3600:
+        try:
+            data = _get("https://fapi.binance.com/fapi/v1/fundingInfo")
+            _bn_intervals = {
+                it["symbol"]: int(it.get("fundingIntervalHours", 8))
+                for it in data if it.get("symbol")
+            }
+            _bn_int_ts = time.time()
+        except Exception as e:
+            logger.warning(f"binance fundingInfo failed: {e}")
+            _bn_int_ts = time.time()  # не дёргаем каждый цикл
+    return _bn_intervals
+
+
 def scan_once() -> list[dict]:
     """Возвращает спреды по общим перпам, отсортированные по |спреду|."""
     by = _get("https://api.bybit.com/v5/market/tickers?category=linear")
     by_fr: dict[str, float] = {}
     by_px: dict[str, float] = {}
+    by_ba: dict[str, tuple[float, float]] = {}   # (bid, ask)
     for it in by["result"]["list"]:
         s, fr = it.get("symbol", ""), it.get("fundingRate", "")
         if s.endswith("USDT") and fr:
             try:
                 by_fr[s] = float(fr)
                 by_px[s] = float(it.get("lastPrice", 0))
+                by_ba[s] = (float(it.get("bid1Price", 0)), float(it.get("ask1Price", 0)))
             except ValueError:
                 pass
 
@@ -108,21 +131,46 @@ def scan_once() -> list[dict]:
             except ValueError:
                 pass
 
-    intervals = _bybit_intervals()
+    # bid/ask Binance-перпов — исполнимые цены (один вызов на все символы)
+    bn_ba: dict[str, tuple[float, float]] = {}
+    try:
+        book = _get("https://fapi.binance.com/fapi/v1/ticker/bookTicker")
+        for it in book:
+            s = it.get("symbol", "")
+            if s in bn_fr:
+                bn_ba[s] = (float(it.get("bidPrice", 0)), float(it.get("askPrice", 0)))
+    except Exception as e:
+        logger.warning(f"binance bookTicker failed: {e}")
+
+    by_int = _bybit_intervals()
+    bn_int = _binance_intervals()
     rows = []
     for s in set(by_fr) & set(bn_fr):
-        by_daily = by_fr[s] * (1440 / intervals.get(s, 480))
-        bn_daily = bn_fr[s] * 3  # Binance стандарт 8h (искл. редки — огрубляем)
+        by_daily = by_fr[s] * (1440 / by_int.get(s, 480))
+        bn_daily = bn_fr[s] * (24 / bn_int.get(s, 8))
+        spread_daily = by_daily - bn_daily
         bp, np_ = by_px.get(s, 0), bn_px.get(s, 0)
         gap = round((bp - np_) / np_ * 100, 4) if np_ else None
+
+        # исполнимый вход по bid/ask в направлении сделки (+ = конвергенция за нас)
+        exec_edge = None
+        bb, ba_ = by_ba.get(s, (0, 0))
+        nb, na_ = bn_ba.get(s, (0, 0))
+        if bb and ba_ and nb and na_:
+            if spread_daily > 0:   # SHORT Bybit (sell@bid) + LONG Binance (buy@ask)
+                exec_edge = round((bb - na_) / na_ * 100, 4)
+            else:                  # LONG Bybit (buy@ask) + SHORT Binance (sell@bid)
+                exec_edge = round((nb - ba_) / ba_ * 100, 4)
+
         rows.append({
             "symbol": s,
             "bybit_fr": by_fr[s], "binance_fr": bn_fr[s],
             "bybit_daily_pct": round(by_daily * 100, 4),
             "binance_daily_pct": round(bn_daily * 100, 4),
-            "spread_daily_pct": round((by_daily - bn_daily) * 100, 4),
+            "spread_daily_pct": round(spread_daily * 100, 4),
             "bybit_price": bp, "binance_price": np_,
             "price_gap_pct": gap,
+            "exec_edge_pct": exec_edge,
         })
     rows.sort(key=lambda r: -abs(r["spread_daily_pct"]))
     return rows
@@ -167,13 +215,13 @@ async def main() -> None:
                     continue
                 _last_alert[sym] = time.time()
                 # положительный спред: шорт Bybit + лонг Binance; отрицательный — наоборот
+                plan = "SHORT Bybit + LONG Binance" if sp > 0 else "LONG Bybit + SHORT Binance"
+                # исполнимый вход по bid/ask (fallback на mid-гэп)
                 gap = r["price_gap_pct"] or 0.0
-                if sp > 0:
-                    plan = "SHORT Bybit + LONG Binance"
-                    entry_edge = gap        # шортим дорогую ногу → конвергенция в плюс
-                else:
-                    plan = "LONG Bybit + SHORT Binance"
-                    entry_edge = -gap
+                entry_edge = r["exec_edge_pct"]
+                if entry_edge is None:
+                    entry_edge = gap if sp > 0 else -gap
+                aligned = "✅ aligned" if entry_edge >= 0 else "⚠️ adverse"
                 fees = 0.21  # перп-тейкер ~0.05%×4 сделки (вход+выход обеих ног)
                 cost = fees + max(0.0, -entry_edge)
                 be_hours = cost / abs(sp) * 24 if sp else 0
@@ -181,7 +229,7 @@ async def main() -> None:
                     f"🔀 Funding Spread ≥{ALERT_DAILY_PCT}%/день\n"
                     f"{sym}: {sp:+.3f}%/день (≈{sp*365:+.0f}%/год)\n"
                     f"Bybit {r['bybit_daily_pct']:+.2f}%/д | Binance {r['binance_daily_pct']:+.2f}%/д\n"
-                    f"Δцен перпов: {gap:+.2f}% (вход {'помогает' if entry_edge > 0 else 'стоит'} {abs(entry_edge):.2f}%)\n"
+                    f"Вход по bid/ask: {entry_edge:+.2f}% {aligned}\n"
                     f"Break-even ≈ {be_hours:.1f}ч удержания (комиссии+вход)\n"
                     f"Delta-neutral: {plan}"
                 )
