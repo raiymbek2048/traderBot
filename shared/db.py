@@ -213,6 +213,30 @@ class FundingSpreadSnap(Base):
     ts = Column(DateTime, nullable=False)
 
 
+class SpreadPosition(Base):
+    """Перп-перп funding-spread позиция (Bybit vs Binance), обе ноги в USDT."""
+    __tablename__ = "spread_positions"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    symbol = Column(String(24), nullable=False)
+    direction = Column(String(16), nullable=False)  # short_bybit | short_binance
+    size_usdt = Column(Float, nullable=False)       # notional одной ноги
+    qty = Column(Float)                              # одинаковое кол-во монет обеих ног
+    bybit_entry_price = Column(Float)                # исполнимые bid/ask на входе
+    binance_entry_price = Column(Float)
+    bybit_exit_price = Column(Float)
+    binance_exit_price = Column(Float)
+    entry_spread_daily_pct = Column(Float)           # спред фандинга на входе, %/день
+    entry_exec_edge_pct = Column(Float)              # исполнимый вход (+= помогает)
+    funding_collected_usdt = Column(Float, default=0.0)  # Σ(шорт-нога − лонг-нога), settled
+    basis_pnl_usdt = Column(Float)
+    fees_usdt = Column(Float)
+    pnl_usdt = Column(Float)
+    status = Column(String(16), default="open")      # open / closed
+    paper = Column(Boolean, default=True)
+    opened_at = Column(DateTime, default=utcnow)
+    closed_at = Column(DateTime)
+
+
 class LiqEvent(Base):
     """Ликвидация с Bybit WS (allLiquidation) — для анализа каскадов/отскоков."""
     __tablename__ = "liq_events"
