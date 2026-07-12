@@ -51,10 +51,14 @@ FEES_RT_PCT    = 0.0021  # перп-тейкер ×4: Bybit 0.055×2 + Binance 0
 CHECK_SEC      = 300     # такт = такт сканера
 ACCRUE_EVERY   = 6       # пересчёт фандинга каждые N тактов (30 мин)
 
+REENTRY_COOLDOWN_S = 4 * 3600   # после закрытия символа не входим 4ч (анти флип-флоп)
+SETTLED_CONFIRM_24H = 0.001     # |Σ settled-спреда за 24ч| ≥ 0.1% и знак совпадает
+
 _tg_token = ""
 _tg_chat = ""
 _above: dict[str, int] = {}
 _below: dict[str, int] = {}
+_cooldown: dict[str, float] = {}   # symbol → unix ts закрытия
 
 
 def _tg(text: str) -> None:
@@ -102,6 +106,14 @@ def _exit_prices(bybit: BybitClient, symbol: str, direction: str) -> tuple[float
     if direction == "short_bybit":     # закрытие: buy Bybit @ask, sell Binance @bid
         return by_ask, bn_bid
     return by_bid, bn_ask
+
+
+def _settled_spread_24h(bybit: BybitClient, symbol: str) -> float:
+    """Σ(Bybit) − Σ(Binance) фактически начисленных ставок за последние 24ч."""
+    since = int((time.time() - 24 * 3600) * 1000)
+    by_sum = sum(r for _, r in bybit.get_settled_fundings(symbol, since))
+    bn_sum = _binance_settled(symbol, since)
+    return by_sum - bn_sum
 
 
 def _accrue(bybit: BybitClient, pos: SpreadPosition) -> float:
@@ -172,6 +184,7 @@ async def close_pos(engine, bybit: BybitClient, pos_id: int, reason: str) -> Non
             s.commit()
             pnl = pos.pnl_usdt
 
+        _cooldown[sym] = time.time()
         logger.info(f"CLOSE {sym} ({reason}) basis={basis:+.4f} funding={collected:+.4f} "
                     f"fees={fees:.4f} pnl={pnl:+.4f}")
         _tg(f"🔴 [PAPER] Perp-Perp CLOSE ({reason})\n{sym}\n"
@@ -240,10 +253,28 @@ async def main() -> None:
             slots = MAX_POSITIONS - len(open_map)
             cands = sorted((r for r in rows
                             if _above.get(r["symbol"], 0) >= ENTRY_CONFIRM
-                            and r["symbol"] not in open_map),
+                            and r["symbol"] not in open_map
+                            and time.time() - _cooldown.get(r["symbol"], 0) > REENTRY_COOLDOWN_S),
                            key=lambda x: -abs(x["spread_daily_pct"]))
-            for r in cands[:max(0, slots)]:
+            opened = 0
+            for r in cands:
+                if opened >= max(0, slots):
+                    break
+                # подтверждение settled-историей: предсказанный спред должен
+                # совпадать по знаку с фактически начисленным за 24ч (анти-SXT)
+                try:
+                    settled = await asyncio.get_event_loop().run_in_executor(
+                        None, _settled_spread_24h, bybit, r["symbol"])
+                except Exception as e:
+                    logger.warning(f"settled check {r['symbol']}: {e}")
+                    continue
+                sign = 1 if r["spread_daily_pct"] > 0 else -1
+                if sign * settled < SETTLED_CONFIRM_24H:
+                    logger.info(f"skip {r['symbol']}: settled 24h {settled*100:+.3f}% "
+                                f"не подтверждает предсказанный {r['spread_daily_pct']:+.2f}%/д")
+                    continue
                 await open_pos(engine, bybit, r)
+                opened += 1
 
             # периодический пересчёт фандинга
             tick += 1
