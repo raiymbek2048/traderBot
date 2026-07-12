@@ -31,7 +31,7 @@ async def main() -> None:
 
     paper      = cfg.paper_trading
     size_usdt  = float(os.environ.get("FUNDING_SIZE_USDT", "50.0"))
-    entry_thr  = float(os.environ.get("ENTRY_THRESHOLD", "0.0005"))
+    entry_thr  = float(os.environ.get("ENTRY_THRESHOLD", "0.002"))  # 0.2%/сеттлмент (persistence-анализ)
     exit_thr   = float(os.environ.get("EXIT_THRESHOLD",  "0.0001"))
 
     monitor.ENTRY_THRESHOLD = entry_thr
