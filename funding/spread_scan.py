@@ -109,6 +109,7 @@ def scan_once() -> list[dict]:
     by_fr: dict[str, float] = {}
     by_px: dict[str, float] = {}
     by_ba: dict[str, tuple[float, float]] = {}   # (bid, ask)
+    by_next: dict[str, int] = {}
     for it in by["result"]["list"]:
         s, fr = it.get("symbol", ""), it.get("fundingRate", "")
         if s.endswith("USDT") and fr:
@@ -116,18 +117,21 @@ def scan_once() -> list[dict]:
                 by_fr[s] = float(fr)
                 by_px[s] = float(it.get("lastPrice", 0))
                 by_ba[s] = (float(it.get("bid1Price", 0)), float(it.get("ask1Price", 0)))
+                by_next[s] = int(it.get("nextFundingTime") or 0)
             except ValueError:
                 pass
 
     bn = _get("https://fapi.binance.com/fapi/v1/premiumIndex")
     bn_fr: dict[str, float] = {}
     bn_px: dict[str, float] = {}
+    bn_next: dict[str, int] = {}
     for it in bn:
         s, fr = it.get("symbol", ""), it.get("lastFundingRate", "")
         if s.endswith("USDT") and fr:
             try:
                 bn_fr[s] = float(fr)
                 bn_px[s] = float(it.get("markPrice", 0))
+                bn_next[s] = int(it.get("nextFundingTime") or 0)
             except ValueError:
                 pass
 
@@ -171,6 +175,11 @@ def scan_once() -> list[dict]:
             "bybit_price": bp, "binance_price": np_,
             "price_gap_pct": gap,
             "exec_edge_pct": exec_edge,
+            "book_width_pct": (
+                round(((ba_ - bb) / ((ba_ + bb) / 2) + (na_ - nb) / ((na_ + nb) / 2)) * 100, 4)
+                if bb and ba_ and nb and na_ else None
+            ),
+            "next_funding_ms": min(by_next.get(s) or 2**62, bn_next.get(s) or 2**62),
         })
     rows.sort(key=lambda r: -abs(r["spread_daily_pct"]))
     return rows
@@ -195,9 +204,13 @@ async def main() -> None:
             rows = await asyncio.get_event_loop().run_in_executor(None, scan_once)
             now = utcnow()
 
+            _snap_fields = {"symbol", "bybit_fr", "binance_fr", "bybit_daily_pct",
+                            "binance_daily_pct", "spread_daily_pct", "bybit_price",
+                            "binance_price", "price_gap_pct", "exec_edge_pct"}
             with Session(engine) as session:
                 for r in rows[:TOP_N_SAVE]:
-                    session.add(FundingSpreadSnap(ts=now, **r))
+                    session.add(FundingSpreadSnap(
+                        ts=now, **{k: v for k, v in r.items() if k in _snap_fields}))
                 session.commit()
 
             top5 = "\n".join(

@@ -53,6 +53,9 @@ ACCRUE_EVERY   = 6       # пересчёт фандинга каждые N та
 
 REENTRY_COOLDOWN_S = 4 * 3600   # после закрытия символа не входим 4ч (анти флип-флоп)
 SETTLED_CONFIRM_24H = 0.001     # |Σ settled-спреда за 24ч| ≥ 0.1% и знак совпадает
+MAX_TO_SETTLE_H = 2.5           # вход только если ближайший сеттлмент ≤2.5ч (анти-SXT#11)
+MAX_BOOK_WIDTH = 0.30           # суммарная ширина bid/ask обеих ног, % (анти-VANRY)
+NOPAY_EXIT_H  = 3.5             # прошло ≥3.5ч и collected ≤ 0 → эпизод не платит, выходим
 
 _tg_token = ""
 _tg_chat = ""
@@ -221,14 +224,31 @@ async def main() -> None:
                 ).scalars().all()
                 open_map = {p.symbol: p.id for p in open_ps}
                 open_dirs = {p.symbol: p.direction for p in open_ps}
+                open_meta = {p.symbol: (
+                    (datetime.now(timezone.utc) -
+                     p.opened_at.replace(tzinfo=timezone.utc)).total_seconds() / 3600,
+                    p.funding_collected_usdt or 0.0) for p in open_ps}
+
+            # no-pay выход: эпизод достаточно старый, а фандинг так и не заплатил
+            for sym, (age_h, collected) in list(open_meta.items()):
+                if age_h >= NOPAY_EXIT_H and collected <= 0:
+                    await close_pos(engine, bybit, open_map[sym],
+                                    f"no-pay {age_h:.1f}ч collected={collected:+.4f}")
+                    open_map.pop(sym, None)
+                    _below.pop(sym, None)
 
             # стрики
+            now_ms = time.time() * 1000
             for r in rows:
                 sym, sp = r["symbol"], r["spread_daily_pct"]
                 edge = r.get("exec_edge_pct")
+                width = r.get("book_width_pct")
+                to_settle_h = (r.get("next_funding_ms", 2**62) - now_ms) / 3.6e6
                 ok_entry = (
                     abs(sp) >= ENTRY_DAILY
                     and edge is not None
+                    and width is not None and width <= MAX_BOOK_WIDTH
+                    and 0 <= to_settle_h <= MAX_TO_SETTLE_H
                     and abs(r["bybit_daily_pct"]) <= MAX_ABS_DAILY
                     and abs(r["binance_daily_pct"]) <= MAX_ABS_DAILY
                     and (FEES_RT_PCT * 100 + max(0.0, -edge)) / abs(sp) * 24 <= MAX_BE_HOURS
