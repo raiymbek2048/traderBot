@@ -233,6 +233,7 @@ class SpreadPosition(Base):
     pnl_usdt = Column(Float)
     status = Column(String(16), default="open")      # open / closed
     paper = Column(Boolean, default=True)
+    variant = Column(String(16), default="strict")   # A/B/C-тест правил входа/выхода
     opened_at = Column(DateTime, default=utcnow)
     closed_at = Column(DateTime)
 
@@ -268,6 +269,9 @@ def _migrate_arb_paper(engine) -> None:
         "funding_positions": {
             "fees_usdt": "FLOAT",
             "basis_pnl_usdt": "FLOAT",
+        },
+        "spread_positions": {
+            "variant": "TEXT",
         },
     }
     with engine.begin() as conn:
