@@ -76,10 +76,14 @@ VARIANTS: dict[str, dict] = {
                          nopay=3.5),
     "fast_exit":      _v(exit_=1.0, settled=True, cd=CD, window=2.5, width=0.30,
                          nopay=3.5),
+    # главный кандидат по 48ч данных: жирный эпизод + попутный вход + все фильтры
+    # (оба выигрыша были такими; тонкие эпизоды не окупают цикл ~0.25-0.40%)
+    "fat_aligned":    _v(entry=5.0, settled=True, cd=CD, window=2.5, width=0.30,
+                         nopay=3.5, aligned=True),
 }
 
 # Telegram-алерты сделок — только от реперных (остальные молча в БД + сводка 12ч)
-TG_VARIANTS = {"strict", "aligned_strict"}
+TG_VARIANTS = {"strict", "aligned_strict", "fat_aligned"}
 
 _tg_token = ""
 _tg_chat = ""
