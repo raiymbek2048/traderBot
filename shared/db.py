@@ -238,6 +238,34 @@ class SpreadPosition(Base):
     closed_at = Column(DateTime)
 
 
+class LiqMomentumTrade(Base):
+    """Follow-momentum сделка после каскада ликвидаций (директивная, не delta-neutral).
+
+    Sell-каскад (лонги ликвидированы, цена вниз) → мы SHORT (следуем импульсу).
+    Buy-каскад (шорты ликвидированы, цена вверх) → мы LONG.
+    Держим 15 минут, выход по таймеру.
+    """
+    __tablename__ = "liq_momentum_trades"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    symbol = Column(String(24), nullable=False)
+    cascade_side = Column(String(8), nullable=False)     # Sell / Buy (сторона ликвидаций)
+    cascade_value_usdt = Column(Float)
+    cascade_count = Column(Integer)
+    cascade_end_ts = Column(DateTime, nullable=False)    # для дедупа
+    direction = Column(String(8), nullable=False)        # short / long
+    size_usdt = Column(Float, nullable=False)
+    qty = Column(Float)
+    entry_price = Column(Float)
+    exit_price = Column(Float)
+    entry_ts = Column(DateTime)
+    exit_ts = Column(DateTime)
+    raw_pnl_pct = Column(Float)
+    fees_usdt = Column(Float)
+    pnl_usdt = Column(Float)
+    status = Column(String(16), default="open")
+    paper = Column(Boolean, default=True)
+
+
 class LiqEvent(Base):
     """Ликвидация с Bybit WS (allLiquidation) — для анализа каскадов/отскоков."""
     __tablename__ = "liq_events"
