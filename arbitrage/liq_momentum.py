@@ -235,10 +235,14 @@ async def main() -> None:
                     select(LiqMomentumTrade.symbol)
                     .where(LiqMomentumTrade.status == "open")).all())
                 # дедуп по cascade_end_ts (не входить дважды в один каскад)
-                seen_ends = set(row[0] for row in s.execute(
+                # SQLite возвращает naive datetime — форсим UTC-aware
+                naive_cutoff = (now_utc - timedelta(hours=2)).replace(tzinfo=None)
+                seen_ends_raw = [row[0] for row in s.execute(
                     select(LiqMomentumTrade.cascade_end_ts)
-                    .where(LiqMomentumTrade.entry_ts
-                           >= now_utc - timedelta(hours=2))).all())
+                    .where(LiqMomentumTrade.entry_ts >= naive_cutoff)).all()]
+                seen_ends = set(
+                    (se.replace(tzinfo=timezone.utc) if se and se.tzinfo is None else se)
+                    for se in seen_ends_raw if se)
 
             for cas in cascades:
                 if cas["symbol"] not in TRADEABLE:
