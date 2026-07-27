@@ -304,6 +304,44 @@ class HoldPosition(Base):
     closed_at = Column(DateTime)
 
 
+class MakerFillProbe(Base):
+    """Замер исполнимости ЛИМИТНЫХ ордеров по реальной ленте сделок.
+
+    Зачем: единственный доказанный лом — край равен комиссии (liq-momentum
+    0% → +$1.24, перп-перп maker −$20.97 vs taker −$31.19). Но мейкер полезен
+    только если лимитник реально наливается И не наливается преимущественно
+    в плохих сценариях (adverse selection).
+
+    Метод: ставим ВИРТУАЛЬНЫЙ лимитник на текущем bid/ask и слушаем ленту.
+    Консервативное правило залива: цена должна пройти СТРОГО через нашу
+    (для buy@bid — сделка ниже bid), т.к. в очереди на своём уровне мы последние.
+
+    Ключевые метрики:
+      filled / secs_to_fill        — наливается ли и как быстро
+      mid_move_after_fill_bps      — adverse selection: куда ушла цена ПОСЛЕ залива
+      (для delta-neutral важен joint-fill: обе ноги в одном окне)
+    """
+    __tablename__ = "maker_fill_probes"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    exchange = Column(String(12), nullable=False)      # bybit | binance
+    symbol = Column(String(24), nullable=False)
+    side = Column(String(8), nullable=False)           # buy@bid | sell@ask
+    probe_group = Column(String(40))                   # связка двух ног одного замера
+    limit_price = Column(Float, nullable=False)
+    mid_at_place = Column(Float)
+    book_width_pct = Column(Float)
+    turnover24h = Column(Float)
+    filled = Column(Boolean, default=False)
+    secs_to_fill = Column(Float)                       # None если не налился
+    window_secs = Column(Float)                        # сколько ждали
+    mid_at_fill = Column(Float)
+    mid_after_30s = Column(Float)                      # для adverse selection
+    adverse_bps = Column(Float)                        # >0 = цена ушла против нас
+    trades_seen = Column(Integer, default=0)
+    placed_at = Column(DateTime, default=utcnow)
+    resolved_at = Column(DateTime)
+
+
 class LiqEvent(Base):
     """Ликвидация с Bybit WS (allLiquidation) — для анализа каскадов/отскоков."""
     __tablename__ = "liq_events"
