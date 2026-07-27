@@ -32,6 +32,7 @@ from shared.utils import utcnow
 CHECK_INTERVAL   = 300     # 5 минут
 TOP_N_SAVE       = 20      # сколько топ-спредов писать в БД за цикл
 ALERT_DAILY_PCT  = 1.0     # алерт при |спреде| ≥ 1%/день (365%/год)
+MAX_PRICE_DISLOCATION = 10.0   # >10% расхождение цен = разные активы, не пара
 ALERT_COOLDOWN   = 3600    # не спамить по одному символу чаще раза в час
 
 _tg_token = ""
@@ -149,11 +150,22 @@ def scan_once() -> list[dict]:
     by_int = _bybit_intervals()
     bn_int = _binance_intervals()
     rows = []
+    mismatched = []
     for s in set(by_fr) & set(bn_fr):
+        bp, np_ = by_px.get(s, 0), bn_px.get(s, 0)
+
+        # ⚠️ ОДИН ТИКЕР ≠ ОДИН АКТИВ. Проверено 27.07: 4 из 587 общих тикеров —
+        # разные токены (ONUSDT $88.20 vs $0.177, SNTUSDT 257%, WAVESUSDT 214%,
+        # VINEUSDT 95%). До этого фикса сканер записал 2554 мусорных снимка
+        # с гэпом до 62830% — они бессмысленны и портят любой анализ.
+        if bp > 0 and np_ > 0 and \
+                abs(bp - np_) / min(bp, np_) * 100 > MAX_PRICE_DISLOCATION:
+            mismatched.append((s, bp, np_))
+            continue
+
         by_daily = by_fr[s] * (1440 / by_int.get(s, 480))
         bn_daily = bn_fr[s] * (24 / bn_int.get(s, 8))
         spread_daily = by_daily - bn_daily
-        bp, np_ = by_px.get(s, 0), bn_px.get(s, 0)
         gap = round((bp - np_) / np_ * 100, 4) if np_ else None
 
         # исполнимый вход по bid/ask в направлении сделки (+ = конвергенция за нас)
@@ -181,6 +193,9 @@ def scan_once() -> list[dict]:
             ),
             "next_funding_ms": min(by_next.get(s) or 2**62, bn_next.get(s) or 2**62),
         })
+    if mismatched:
+        logger.warning("отсеяно (РАЗНЫЕ активы под одним тикером): "
+                       + ", ".join(f"{s} {b:g}/{n:g}" for s, b, n in mismatched[:5]))
     rows.sort(key=lambda r: -abs(r["spread_daily_pct"]))
     return rows
 

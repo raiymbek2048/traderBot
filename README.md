@@ -150,6 +150,19 @@ HOLD_SIZE_USDT=50
 | `funding_spread_snaps` | 78k+ снимков спреда фандинга (топ-20 за цикл) |
 | `funding_positions` | Spot+perp позиции с basis/fees/settled-фандингом |
 | `spread_positions` | ⚠️ A/B-журнал перп-перп — **испорчен размножением ×2.5**, дедуплицировать перед выводами |
+| `maker_fill_probes` | 🧪 Исполнимость лимитников по реальной ленте (joint-fill, adverse selection) |
+
+### ⚠️ Известные ловушки в данных
+
+**1. Один тикер ≠ один актив.** Из 587 общих перпов Bybit/Binance **4 — разные
+токены**: `ONUSDT` $88.20 vs $0.177, `SNTUSDT` 257%, `WAVESUSDT` 214%,
+`VINEUSDT` 95%. В `funding_spread_snaps` лежат **2554 мусорных снимка** этих
+тикеров (гэп до 62830%), записанных до фикса. Фильтруй по расхождению цен
+или по списку символов. В `spread_positions` их нет — журнал сделок чист.
+
+**2. `spread_positions` размножен A/B-решёткой ×2.5.** 11 вариантов торговали
+одну возможность параллельно. Дедуплицируй по `(symbol, opened_at ±30 мин)`,
+иначе одна удачная сделка считается 7 раз.
 | `liq_momentum_trades` | 36 сделок follow-momentum |
 | `arb_paper_trades` | Спот-арбитраж (realism v2: VWAP, fillable) |
 
