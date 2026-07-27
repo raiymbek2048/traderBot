@@ -185,6 +185,11 @@ async def cascade_monitor(engine) -> None:
         await asyncio.sleep(POLL_SEC)
 
 
+CAP_RATE_THRESHOLD = 0.005  # |rate| > 0.5%/8h = кап фандинга, вероятно радиоактивный
+MIN_PRICE_FUNDING = 0.01   # отсекаем dust-токены < $0.01
+MIN_TURNOVER_24H = 1_000_000  # минимум $1M оборота за 24ч
+
+
 def _fetch_funding() -> list[dict]:
     url = "https://api.bybit.com/v5/market/tickers?category=linear"
     with urllib.request.urlopen(url, timeout=15) as r:
@@ -196,11 +201,15 @@ def _fetch_funding() -> list[dict]:
         if sym.endswith("USDT") and fr:
             try:
                 rate = float(fr)
+                price = float(it.get("lastPrice", 0))
+                turnover = float(it.get("turnover24h", 0))
                 rows.append({
                     "symbol": sym,
                     "rate": rate,
                     "annual_pct": rate * 3 * 365 * 100,
-                    "price": float(it.get("lastPrice", 0)),
+                    "price": price,
+                    "turnover": turnover,
+                    "capped": abs(rate) >= CAP_RATE_THRESHOLD,
                 })
             except ValueError:
                 pass
@@ -210,21 +219,42 @@ def _fetch_funding() -> list[dict]:
 
 def _format_funding(rows: list[dict]) -> str:
     now = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    # Разделяем на нормальные и радиоактивные
+    normal = [r for r in rows
+              if not r["capped"]
+              and r["price"] >= MIN_PRICE_FUNDING
+              and r["turnover"] >= MIN_TURNOVER_24H][:7]
+    capped = [r for r in rows if r["capped"]]
+
     lines = [f"📊 <b>Экстремальный фандинг</b> ({now})\n"]
-    for r in rows[:7]:
+
+    if not normal:
+        lines.append("Рынок спокойный — экстремальных ставок нет.")
+        return "\n".join(lines)
+
+    for r in normal:
         sym = r["symbol"].replace("USDT", "")
         rate_8h = r["rate"] * 100
         annual = r["annual_pct"]
         emoji = "🔥" if abs(annual) > 200 else ("⚠️" if abs(annual) > 50 else "📈")
         direction = "шорты платят лонгам" if r["rate"] < 0 else "лонги платят шортам"
+        vol = f"${r['turnover']/1_000_000:.0f}M" if r["turnover"] >= 1_000_000 else f"${r['turnover']/1_000:.0f}K"
         lines.append(
             f"{emoji} <b>{sym}</b>: {rate_8h:+.4f}%/8ч ({annual:+.0f}%/год)\n"
-            f"    └ {direction} | ${r['price']:,.4f}"
+            f"    └ {direction} | ${r['price']:,.4f} | vol {vol}"
+        )
+
+    if capped:
+        cap_names = ", ".join(r["symbol"].replace("USDT", "") for r in capped[:5])
+        extra = f" +{len(capped)-5}" if len(capped) > 5 else ""
+        lines.append(
+            f"\n⛔ Капнутый фандинг (пре-делистинг?): {cap_names}{extra}"
         )
 
     lines.append(
         f"\n<i>Фандинг = плата за удержание позиции.\n"
-        f"Высокий → рынок перегрет в одну сторону.</i>"
+        f"Высокий → рынок перегрет в одну сторону.\n"
+        f"⛔ = скорее всего ловушка, не торговый сигнал.</i>"
     )
     return "\n".join(lines)
 
@@ -286,9 +316,13 @@ async def daily_summary(engine) -> None:
 
                     funding = await asyncio.get_event_loop().run_in_executor(
                         None, _fetch_funding)
-                    if funding:
+                    normal_funding = [r for r in funding
+                                      if not r.get("capped")
+                                      and r["price"] >= MIN_PRICE_FUNDING
+                                      and r.get("turnover", 0) >= MIN_TURNOVER_24H]
+                    if normal_funding:
                         lines.append(f"\n📊 Самый высокий фандинг:")
-                        for r in funding[:3]:
+                        for r in normal_funding[:3]:
                             sym_s = r["symbol"].replace("USDT", "")
                             lines.append(
                                 f"  {sym_s}: {r['rate']*100:+.4f}%/8ч "
@@ -303,6 +337,50 @@ async def daily_summary(engine) -> None:
         except Exception as e:
             logger.error(f"daily_summary: {e}")
         await asyncio.sleep(30)
+
+
+WELCOME_POST = (
+    "⚡ <b>Crypto Liquidation Radar</b>\n"
+    "\n"
+    "Автоматические алерты с крипторынка в реальном времени:\n"
+    "\n"
+    "🔴🟢 <b>Каскады ликвидаций</b> — когда за 15 секунд принудительно "
+    "закрывают позиции на $100K+. Сигнал резкой волатильности.\n"
+    "\n"
+    "📊 <b>Экстремальный фандинг</b> — топ монет, где рынок "
+    "максимально перегрет в одну сторону (каждые 4 часа).\n"
+    "\n"
+    "📅 <b>Дневная сводка</b> — итоги ликвидаций и фандинга за день "
+    "(ежедневно в 00:05 UTC).\n"
+    "\n"
+    "Данные: Bybit + Binance, сервер в Токио (задержка 0.3мс).\n"
+    "Бот не даёт торговых рекомендаций — только сырые данные "
+    "для вашего анализа.\n"
+    "\n"
+    "──────────────────\n"
+    "📖 <a href='https://github.com/raiymbek2048/traderBot'>GitHub</a> — "
+    "весь код открыт"
+)
+
+
+def _send_welcome() -> None:
+    if not _public_channel:
+        return
+    sent = _tg(WELCOME_POST, _public_channel)
+    if sent:
+        logger.info("Welcome post sent to channel")
+        # pin it
+        try:
+            data = json.dumps({
+                "chat_id": _public_channel,
+                "text": WELCOME_POST,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            }).encode()
+            # get the message id from the last sent message to pin
+            # (can't pin easily without message_id, skip for now)
+        except Exception:
+            pass
 
 
 async def main() -> None:
@@ -324,6 +402,16 @@ async def main() -> None:
         f"Channel: {_public_channel or 'не задан'}\n"
         f"Алерты: каскады ≥${MIN_CASCADE_USD:,}, фандинг каждые 4ч, дневная сводка"
     )
+
+    # Отправляем welcome пост только если канал пустой (файл-флаг)
+    welcome_flag = os.path.join(os.path.dirname(__file__), ".welcome_sent")
+    if _public_channel and not os.path.exists(welcome_flag):
+        _send_welcome()
+        try:
+            with open(welcome_flag, "w") as f:
+                f.write(datetime.now(timezone.utc).isoformat())
+        except Exception:
+            pass
 
     await asyncio.gather(
         cascade_monitor(engine),
