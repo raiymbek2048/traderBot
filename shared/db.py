@@ -266,6 +266,44 @@ class LiqMomentumTrade(Base):
     paper = Column(Boolean, default=True)
 
 
+class HoldPosition(Base):
+    """Перп-перп с МИНИМАЛЬНЫМ ХОЛДОМ до сеттлмента (тест 27.07.2026).
+
+    Отдельная таблица от spread_positions: тот журнал испорчен A/B-размножением
+    (11 вариантов на одном потоке → одна возможность в 2.5 записи). Здесь строго
+    один вариант, одна позиция на символ → каждая строка = уникальное наблюдение.
+
+    PnL считается СРАЗУ в двух режимах комиссий — бесплатная чувствительность
+    без повторного прогона.
+    """
+    __tablename__ = "hold_positions"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    symbol = Column(String(24), nullable=False)
+    direction = Column(String(16), nullable=False)     # short_bybit | short_binance
+    size_usdt = Column(Float, nullable=False)
+    qty = Column(Float)
+    bybit_entry_price = Column(Float)
+    binance_entry_price = Column(Float)
+    bybit_exit_price = Column(Float)
+    binance_exit_price = Column(Float)
+    entry_spread_daily_pct = Column(Float)
+    entry_book_width_pct = Column(Float)
+    hours_to_settle_at_entry = Column(Float)   # проверка правила входа
+    settlements_survived = Column(Integer, default=0)  # ГЛАВНАЯ метрика теста
+    hold_hours = Column(Float)
+    funding_collected_usdt = Column(Float, default=0.0)
+    basis_pnl_usdt = Column(Float)
+    fees_taker_usdt = Column(Float)
+    fees_maker_usdt = Column(Float)
+    pnl_taker_usdt = Column(Float)   # реальность
+    pnl_maker_usdt = Column(Float)   # апсайд при мейкер-исполнении
+    exit_reason = Column(String(64))
+    status = Column(String(16), default="open")
+    paper = Column(Boolean, default=True)
+    opened_at = Column(DateTime, default=utcnow)
+    closed_at = Column(DateTime)
+
+
 class LiqEvent(Base):
     """Ликвидация с Bybit WS (allLiquidation) — для анализа каскадов/отскоков."""
     __tablename__ = "liq_events"
