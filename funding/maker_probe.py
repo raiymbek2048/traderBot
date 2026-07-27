@@ -418,17 +418,26 @@ async def report(engine) -> None:
                     MakerFillProbe.probe_group, MakerFillProbe.exchange,
                     MakerFillProbe.symbol, MakerFillProbe.filled,
                     MakerFillProbe.secs_to_fill, MakerFillProbe.adverse_bps,
-                    MakerFillProbe.book_width_pct
+                    MakerFillProbe.book_width_pct, MakerFillProbe.trades_seen
                 ).where(MakerFillProbe.resolved_at.isnot(None))).all()
             if len(rows) < 4:
                 continue
 
             groups = defaultdict(list)
-            for g, ex, sym, f, secs, adv, w in rows:
+            for g, ex, sym, f, secs, adv, w, tr in rows:
                 groups[g].append({"ex": ex, "sym": sym, "f": bool(f),
-                                  "secs": secs, "adv": adv, "w": w})
-            complete = [v for v in groups.values() if len(v) == 2]
+                                  "secs": secs, "adv": adv, "w": w,
+                                  "tr": tr or 0})
+            # ⚠️ Нога с нулевой лентой — это НЕ «не залилось», это НЕ ИЗМЕРЕНО.
+            # Так баг Binance @aggTrade дал бы вывод «мейкер не работает на
+            # Binance» вместо «канал данных пуст». Такие группы отбрасываем.
+            complete = [v for v in groups.values()
+                        if len(v) == 2 and all(x["tr"] > 0 for x in v)]
+            no_tape = sum(1 for v in groups.values()
+                          if len(v) == 2 and any(x["tr"] == 0 for x in v))
             if not complete:
+                logger.warning(f"нет валидных замеров "
+                               f"(отброшено без ленты: {no_tape})")
                 continue
 
             joint = sum(1 for v in complete if all(x["f"] for x in v))
@@ -456,7 +465,9 @@ async def report(engine) -> None:
             logger.info(f"[report] замеров={len(complete)} joint={jr:.0f}% "
                         f"adverse={mean_adv:+.2f}bps A={ok_a} B={ok_b}")
 
-            msg = (f"🧪 MAKER PROBE (замеров: {len(complete)})\n\n"
+            msg = (f"🧪 MAKER PROBE (валидных замеров: {len(complete)}"
+                   + (f", отброшено без ленты: {no_tape}" if no_tape else "")
+                   + ")\n\n"
                    f"Обе ноги залились: {joint} ({jr:.0f}%)\n"
                    f"Только одна: {partial} | Ни одной: {none_}\n"
                    f"Медиана времени залива: "
