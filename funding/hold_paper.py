@@ -58,6 +58,14 @@ MIN_SPREAD_DAILY = 3.0      # %/день — ниже не окупает раз
 MAX_SPREAD_DAILY = 8.0      # выше = радиоактивно (кап/пре-делистинг)
 MAX_HOURS_TO_SETTLE = 4.0   # вход только в окне перед начислением
 MAX_BOOK_WIDTH = 0.30       # % суммарная ширина стаканов обеих бирж
+
+# ⚠️ ОДИН ТИКЕР ≠ ОДИН АКТИВ. Проверено 27.07: 4 из 587 общих тикеров —
+# РАЗНЫЕ токены на двух биржах (ONUSDT $88.20 vs $0.177 = расхождение 49708%,
+# SNTUSDT 257%, WAVESUSDT 214%, VINEUSDT 95%). Открыть на таком «delta-neutral»
+# позицию = голая направленная ставка на два несвязанных актива сразу.
+# Легитимные перп-перп гэпы одного актива < 5% (даже сломанный PARTI был 4%),
+# поэтому порог 10% чисто разделяет «дислокация» и «другой актив».
+MAX_PRICE_DISLOCATION = 10.0
 SIZE_USDT = float(os.environ.get("HOLD_SIZE_USDT", "50"))
 MAX_POSITIONS = 3
 COOLDOWN_S = 4 * 3600       # на символ после закрытия
@@ -189,10 +197,22 @@ def scan() -> list[dict]:
         logger.warning(f"binance book failed: {e}")
 
     out = []
+    skipped_mismatch = []
     for s in set(byd) & set(bnd):
         b, n = byd[s], bnd[s]
         if not all((b["bid"], b["ask"], n.get("bid"), n.get("ask"))):
             continue
+
+        # ⚠️ ГЛАВНАЯ ЗАЩИТА: один тикер ≠ один актив (см. MAX_PRICE_DISLOCATION)
+        by_mid = (b["bid"] + b["ask"]) / 2
+        bn_mid = (n["bid"] + n["ask"]) / 2
+        if by_mid <= 0 or bn_mid <= 0:
+            continue
+        disloc = abs(by_mid - bn_mid) / min(by_mid, bn_mid) * 100
+        if disloc > MAX_PRICE_DISLOCATION:
+            skipped_mismatch.append((s, by_mid, bn_mid, disloc))
+            continue
+
         by_daily = b["fr"] * (1440 / _by_intervals.get(s, 480)) * 100
         bn_daily = n["fr"] * (24 / _bn_intervals.get(s, 8)) * 100
         spread = by_daily - bn_daily
@@ -204,6 +224,11 @@ def scan() -> list[dict]:
             "by_bid": b["bid"], "by_ask": b["ask"],
             "bn_bid": n["bid"], "bn_ask": n["ask"],
         })
+    if skipped_mismatch:
+        top = sorted(skipped_mismatch, key=lambda x: -x[3])[:4]
+        logger.warning(
+            "отсеяно по расхождению цен (РАЗНЫЕ активы под одним тикером): "
+            + ", ".join(f"{s} {bm:g}/{nm:g} ({d:.0f}%)" for s, bm, nm, d in top))
     out.sort(key=lambda r: -abs(r["spread"]))
     return out
 

@@ -69,6 +69,10 @@ N_SYMBOLS = 5              # сколько символов держать по
 REFRESH_SYMBOLS_S = 3600
 BASELINE = "ETHUSDT"       # эталон ликвидности, всегда в наборе
 
+# ⚠️ один тикер ≠ один актив (проверено 27.07: 4 из 587 общих тикеров).
+# ONUSDT $88.20 vs $0.177, SNTUSDT 257%, WAVESUSDT 214%, VINEUSDT 95%.
+MAX_PRICE_DISLOCATION = 10.0
+
 # последние сделки: symbol → deque[(ts, price)]
 _trades: dict[str, deque] = defaultdict(lambda: deque(maxlen=4000))
 # книги: (exchange, symbol) → (bid, ask, ts)
@@ -101,13 +105,31 @@ def pick_symbols() -> list[str]:
             if s.endswith("USDT") and it.get("fundingRate"):
                 try:
                     byd[s] = {"fr": float(it["fundingRate"]),
-                              "turn": float(it.get("turnover24h") or 0)}
+                              "turn": float(it.get("turnover24h") or 0),
+                              "px": float(it.get("lastPrice") or 0)}
                 except ValueError:
                     pass
-        bn = {it["symbol"] for it in
-              _get("https://fapi.binance.com/fapi/v1/premiumIndex")
-              if it.get("symbol", "").endswith("USDT")}
-        common = [(s, d) for s, d in byd.items() if s in bn]
+        bn = {}
+        for it in _get("https://fapi.binance.com/fapi/v1/premiumIndex"):
+            s = it.get("symbol", "")
+            if s.endswith("USDT") and it.get("markPrice"):
+                try:
+                    bn[s] = float(it["markPrice"])
+                except ValueError:
+                    pass
+        # ⚠️ один тикер ≠ один актив: ONUSDT $88.20 (Bybit) vs $0.177 (Binance).
+        # Замерять исполнимость на разных активах бессмысленно.
+        common = []
+        for s, d in byd.items():
+            if s not in bn:
+                continue
+            bp, np_ = d.get("px", 0), bn[s]
+            if bp > 0 and np_ > 0 and \
+                    abs(bp - np_) / min(bp, np_) * 100 > MAX_PRICE_DISLOCATION:
+                logger.warning(f"пропуск {s}: цены расходятся "
+                               f"{bp:g}/{np_:g} — разные активы")
+                continue
+            common.append((s, d))
         # средний оборот: не мажоры (там ловить нечего), но и не dust
         mid = [s for s, d in common if 2e6 <= d["turn"] <= 2e8]
         mid.sort(key=lambda s: -abs(byd[s]["fr"]))
@@ -191,8 +213,13 @@ async def binance_stream() -> None:
             if not syms:
                 await asyncio.sleep(5)
                 continue
+            # ⚠️ @aggTrade на USDⓈ-M фьючерсах Binance НЕ отдаёт данные:
+            # замерено 27.07 — 3436 bookTicker и 0 aggTrade за 20с по ETHUSDT,
+            # ни в комби-, ни в одиночном стриме, ни в нижнем регистре.
+            # @trade работает (618 сообщений за 12с). Из-за этого лента Binance
+            # была пуста и ВСЕ ноги Binance показывали trades_seen=0.
             streams = "/".join(
-                [f"{s.lower()}@aggTrade" for s in syms] +
+                [f"{s.lower()}@trade" for s in syms] +
                 [f"{s.lower()}@bookTicker" for s in syms])
             url = f"{BN_WS}?streams={streams}"
             async with websockets.connect(url, ping_interval=20,
@@ -204,7 +231,7 @@ async def binance_stream() -> None:
                     m = json.loads(raw)
                     d = m.get("data") or {}
                     ev = d.get("e", "")
-                    if ev == "aggTrade":
+                    if ev in ("trade", "aggTrade"):
                         try:
                             _trades[f"binance:{d['s']}"].append(
                                 (int(d["T"]) / 1000, float(d["p"])))
