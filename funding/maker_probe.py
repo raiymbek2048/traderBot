@@ -285,7 +285,7 @@ async def one_probe(engine, sym: str, turnover: float) -> None:
         for ex, side, px, _, _ in legs:
             if (ex, side) in fills:
                 continue
-            ts = _crossed(ex, side, px, t0)
+            ts = _crossed(ex, sym, side, px, t0)
             if ts:
                 fills[(ex, side)] = ts
 
@@ -367,9 +367,15 @@ async def prober(engine) -> None:
                 await asyncio.sleep(30)
                 continue
 
-            await asyncio.gather(*[
+            # return_exceptions=True удобен (одна нога не валит круг), но он
+            # ГЛОТАЕТ ошибки: из-за этого опечатка в _crossed() три круга
+            # молча писала неразрешённые записи. Теперь исключения логируем.
+            res = await asyncio.gather(*[
                 one_probe(engine, s, turnovers.get(s, 0.0)) for s in live
             ], return_exceptions=True)
+            for sym, r in zip(live, res):
+                if isinstance(r, BaseException):
+                    logger.error(f"[probe] {sym} упал: {type(r).__name__}: {r}")
         except Exception as e:
             logger.error(f"prober: {e}")
         await asyncio.sleep(PROBE_EVERY_S)
