@@ -1,154 +1,172 @@
 # TraderBot
 
-Автоматизированная торговая система для Bybit (ETHUSDT perpetual). Две независимые стратегии + Alpha Gate фильтр сигналов.
+Трёхмесячное исследование: существует ли устойчивый край в розничном
+крипто-алготрейдинге на публичных сигналах. **Проверено 8 гипотез, 7 закрыты
+количественно, 1 в тесте. Реальными деньгами не рискнули ни разу.**
 
-## Архитектура
+📖 **Начни отсюда:**
+- [`PROJECT_JOURNEY.md`](PROJECT_JOURNEY.md) — полная история: 19 фаз, 28 багов,
+  18 уроков, все цифры
+- [`LOOPHOLE_SEARCH.md`](LOOPHOLE_SEARCH.md) — поиск лазейки: репрайсинг журналов
+  под непроверенные режимы исполнения
+- [`STRATEGY_NEXT.md`](STRATEGY_NEXT.md) — что делать дальше и почему
+
+---
+
+## Главный результат
+
+```
+Спот-арбитраж мажоры:  край 0.04-0.08%  vs комиссии 0.20%     ❌
+Спот-арбитраж альты:   $2-7/день, ребаланс съедает            ❌
+Funding spot+perp:     0 входов за 2 недели при пороге 0.20%   ❌
+Перп-перп spread:      146 сделок / −$30.59                    ❌
+Liq-momentum:          36 сделок / −$0.74, режимно-зависим     ❌
+Momentum 5m:           0 сделок за 3 недели                    ❌
+Cross-sectional carry: фандинг +$110, basis −$175              ❌
+Buy&hold фандинга:     обвал ×30 out-of-sample                 ❌
+Перп-перп + мин.холд:  запущен 27.07, критерии заранее         🧪
+```
+
+**Край всегда примерно равен комиссии.** Два независимых замера на своих журналах:
+
+| Стратегия | taker | 0% / maker |
+|---|:---:|:---:|
+| liq-momentum (36 сделок) | −$0.74 | **+$1.24** |
+| перп-перп (146 сделок) | −$31.19 | −$20.97 |
+
+Сигнал реален, он целиком уходит бирже. Отсюда вывод: атаковать структуру
+комиссий, а не искать новый индикатор.
+
+---
+
+## Активные сервисы (AWS Lightsail Tokyo, systemd)
+
+| Сервис | Модуль | Роль |
+|---|---|---|
+| `holdtest` | `funding.hold_paper` | 🧪 Перп-перп с мин.холдом до начисления. Критерии успеха зафиксированы в докстринге **до** первой сделки |
+| `publicalerts` | `alerts.public` | Канал [@crypto_liq_radar](https://t.me/crypto_liq_radar): каскады ≥$100k, фандинг каждые 4ч, дневная сводка |
+| `liqrec` | `arbitrage.liq_recorder` | Рекордер ликвидаций Bybit WS → 84k+ событий |
+| `funding` | `funding.run` | Скан 619 перпов, spot+perp delta-neutral, порог 0.20% |
+
+**Остановлены** (доказали неработоспособность): `liqmom`, `momentum`,
+`spreadarb`, `fundspread`, `spreadpaper`.
+
+---
+
+## Структура
 
 ```
 traderbot/
-├── analyst/            # Данные: funding rate, OHLCV, OI
-│   ├── fetcher.py      # BybitFetcher (ccxt + httpx fallback)
-│   ├── signal.py       # Сигналы стратегии A (funding MR)
-│   └── main.py         # Аналитик-демон
-├── executor/           # Исполнение ордеров
-│   ├── position.py     # Управление позицией
-│   └── main.py         # Экзекьютор-демон
-├── gate/               # Alpha Gate v2 (shadow mode)
-│   ├── scorer.py       # Composite score (liq×0.5 + div×0.3 + onchain×0.2)
-│   ├── main.py         # Gate-демон (shadow, пишет GateDecision в БД)
-│   └── sources/
-│       ├── funding_divergence.py   # Bybit vs Binance spread
-│       ├── liquidation_screen.py  # Прокси ликвидаций по объёму
-│       └── macro_blocker.py       # RSS-фильтр системных событий
-├── momentum/           # Стратегия B: 5m momentum (paper only)
-│   ├── signal.py       # EMA cross + OI delta + VWAP / BTC lead-lag
-│   └── main.py         # Momentum-демон (синхрон по 5m свечам)
-├── shared/
-│   ├── config.py       # Config из .env
-│   └── db.py           # SQLAlchemy модели (SQLite / PostgreSQL)
+├── funding/
+│   ├── hold_paper.py    🧪 мин.холд до начисления (единственный активный тест)
+│   ├── executor.py         BybitClient, delta-neutral spot+perp, settled-accrual
+│   ├── monitor.py          скан всех перпов, анти-churn стрики
+│   ├── run.py              лончер funding
+│   ├── spread_scan.py      сканер спреда фандинга Bybit vs Binance
+│   └── spread_paper.py     ⛔ A/B-решётка 11 вариантов (закрыта, журнал испорчен)
+├── alerts/
+│   └── public.py         📡 публичный канал алертов
+├── arbitrage/
+│   ├── liq_recorder.py     рекордер ликвидаций (heartbeat WS)
+│   ├── liq_momentum.py  ⛔ follow-momentum после каскадов (закрыт)
+│   ├── monitor.py       ⛔ спот-арбитраж VWAP по глубине (закрыт)
+│   ├── executor.py         атомарное исполнение + unwind голой ноги
+│   ├── scan.py             скан альтов на спреды
+│   └── validate.py         депт-валидатор кандидатов
 ├── scripts/
-│   ├── backtest.py             # Бэктест стратегии A (funding MR)
-│   ├── momentum_backtest.py    # Бэктест стратегии B (5m momentum)
-│   ├── gate_backtest.py        # Исторический бэктест Alpha Gate
-│   └── gate_effectiveness.py  # Пост-анализ shadow-mode данных
-├── .env                # Параметры (см. ниже)
-└── traderbot.db        # SQLite база данных
+│   ├── loophole_analysis.py  🔍 репрайсинг журналов под maker/hold
+│   ├── hold_validation.py    🔍 hold-модель на 2 мес settled-истории
+│   ├── carry_backtest.py     cross-sectional carry (вердикт: −$102)
+│   ├── funding_persistence.py  эпизодная модель, пороги из данных
+│   ├── liq_cascade_analysis.py  659 каскадов, опровержение отскока
+│   └── liq_impulse_analysis.py  sub-second, задержка входа
+├── shared/
+│   ├── db.py               SQLAlchemy модели + ALTER-миграции
+│   ├── config.py           Config из .env
+│   └── utils.py
+└── traderbot.db            SQLite
 ```
 
-## Стратегии
+⛔ = закрытая стратегия, код оставлен как история
+🔍 = аналитический скрипт
+🧪 = активный тест
 
-### Стратегия A — Funding Rate Mean Reversion
-- **Таймфрейм:** 1h / 4h
-- **Сигнал:** funding rate аномалия + RSI + SMA тренд
-- **Частота:** ~7 сделок/месяц
-- **Режим:** paper trading
+**Мёртвый код** (майские модули, не используются ни одним сервисом):
+`analyst/`, `bot/`, `executor/`, `risk_manager/`, `gate/`, `momentum/`.
 
-### Стратегия B — 5m VWAP Mean Reversion ✅ Валидирована
-- **Таймфрейм:** 5 минут
-- **ETH branch:** цена отклоняется >0.5% от 4h rolling VWAP + volume spike + RSI(2) > 80 / < 20 → фейдим отклонение
-- **BTC branch:** BTC cumulative 3-bar return > 0.20%, ETH ещё не отреагировал → входим за BTC
-- **Режим:** ETH branch — ranging/transition; BTC branch — trending/transition
-- **SL/TP:** 0.20% / 0.40% (R:R = 2:1), breakeven WR = 53.5%
-- **Max hold:** 24 бара (2 часа)
-- **Частота:** ~1/день
-
-**Backtest результаты (90d):** WR=59.8%, total=+6.15%, Sharpe=N/A  
-**Validation (180d):** WR=58.5%, total=+11.26%, Sharpe=3.23, MaxDD=-1.43% ✅
-
-## Alpha Gate v2 (shadow mode)
-
-Фильтр сигналов на основе 3 источников:
-
-| Источник | Вес | Описание |
-|---|---|---|
-| Liquidation screen | 0.5 | Объём-прокси ликвидаций |
-| Funding divergence | 0.3 | Bybit vs Binance спред > 0.01% |
-| On-chain | 0.2 | Зарезервировано |
-
-Порог: `composite_score ≥ 0.6` → approve. Shadow mode = записывает решения без блокировки входов.
-
-Исторический бэктест (12 мес): `gate_effectiveness = +113.2%`, `win_rate_delta = +9.2%` ✅
+---
 
 ## Запуск
 
-### Установка
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -e .
+python -m venv .venv && source .venv/bin/activate
+pip install websockets loguru sqlalchemy python-dotenv numpy ccxt httpx
+
+# активный тест
+python -m funding.hold_paper
+
+# публичные алерты (нужен PUBLIC_CHANNEL_ID)
+python -m alerts.public
+
+# рекордер данных
+python -m arbitrage.liq_recorder
 ```
 
-### Демоны (paper mode)
+### Анализ на собранных данных
 ```bash
-# Alpha Gate shadow mode
-python -m gate.main &
-
-# Momentum paper trading
-python -m momentum.main &
-
-# Analyst + Executor (стратегия A)
-python -m analyst.main &
-python -m executor.main &
+python scripts/loophole_analysis.py   # репрайсинг журналов
+python scripts/hold_validation.py     # out-of-sample hold-модель
+python scripts/carry_backtest.py      # cross-sectional carry
 ```
 
-### Бэктесты
-```bash
-# Momentum strategy
-python scripts/momentum_backtest.py --days 90
-python scripts/momentum_backtest.py --days 180 --sl 0.003 --tp 0.006
-
-# Alpha Gate validation
-python scripts/gate_backtest.py --months 12
-
-# Post-shadow analysis (после накопления данных)
-python scripts/gate_effectiveness.py
-```
+---
 
 ## Конфигурация (.env)
 
 ```env
 BYBIT_API_KEY=...
 BYBIT_API_SECRET=...
-BYBIT_TESTNET=false
+BINANCE_API_KEY=...
+BINANCE_API_SECRET=...
 
 TELEGRAM_BOT_TOKEN=...
-TELEGRAM_CHAT_ID=...
+TELEGRAM_CHAT_ID=...          # приватный чат
+PUBLIC_CHANNEL_ID=@channel    # публичный канал алертов
 
 DATABASE_URL=sqlite:///traderbot.db
+PAPER_TRADING=true            # ⚠️ всё в paper, реальная торговля не включалась
 
-# Стратегия A
-SYMBOL=ETHUSDT
-LEVERAGE=2
-RISK_PER_TRADE=0.015
-FUNDING_THRESHOLD=0.0001
-STOP_LOSS_PCT=0.01
-TAKE_PROFIT_PCT=0.02
-PAPER_TRADING=true
-
-# Стратегия B (momentum)
-MOMENTUM_ENABLED=true
-MOMENTUM_SL_PCT=0.0035
-MOMENTUM_TP_PCT=0.0070
-MOMENTUM_BTC_THRESHOLD=0.0035
-MOMENTUM_EMA_FAST=8
-MOMENTUM_EMA_SLOW=21
-MOMENTUM_VWAP_THRESHOLD=0.002
-MOMENTUM_MAX_HOLD_BARS=24
+HOLD_SIZE_USDT=50
 ```
+
+---
 
 ## База данных
 
 | Таблица | Описание |
 |---|---|
-| `signals` | Сигналы стратегии A |
-| `trades` | Сделки стратегии A |
-| `momentum_trades` | Сделки стратегии B (paper) |
-| `gate_decisions` | Alpha Gate решения (shadow mode) |
-| `funding_rates` | История funding rates |
+| `hold_positions` | 🧪 Тест мин.холда. Чистая: один вариант, PnL в двух режимах комиссий |
+| `liq_events` | 84k+ ликвидаций Bybit, $286M |
+| `funding_spread_snaps` | 78k+ снимков спреда фандинга (топ-20 за цикл) |
+| `funding_positions` | Spot+perp позиции с basis/fees/settled-фандингом |
+| `spread_positions` | ⚠️ A/B-журнал перп-перп — **испорчен размножением ×2.5**, дедуплицировать перед выводами |
+| `liq_momentum_trades` | 36 сделок follow-momentum |
+| `arb_paper_trades` | Спот-арбитраж (realism v2: VWAP, fillable) |
 
-## Текущий статус
+---
 
-| Компонент | PID | Статус |
-|---|---|---|
-| gate.main | 2277 | ✅ shadow mode |
-| momentum.main | 9063 | ✅ paper trading (валидирована) |
+## Ключевые уроки метода
+
+Полный список (18) в [`PROJECT_JOURNEY.md`](PROJECT_JOURNEY.md). Три самых дорогих:
+
+1. **Задержка искажает сами данные.** Медленный сервер (500-1100ms) «видел»
+   спреды, которых не было — все `+$1731/день` были артефактом измерения.
+   Инфраструктура — часть измерительного прибора.
+
+2. **A/B-решётка портит ретро-анализ подвыборок.** 11 вариантов на одном потоке
+   пишут одну возможность как 2.5 записи. Любая нарезка журнала обманывает:
+   правило дало +$0.402 на 34 записях и −$1.42 на 14 уникальных.
+
+3. **Слишком хорошо = ловушка.** Подтверждено четырежды: висящий спред 5%
+   (закрытый вывод), фандинг −48%/д (пре-делистинг), спред 8%+/д (basis −0.5%),
+   buy&hold +334%/год (токенизированные акции без спота).
