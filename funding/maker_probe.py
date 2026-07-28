@@ -29,11 +29,36 @@
     adverse_bps > 0  = цена ушла ПРОТИВ нас (плохой залив)
     adverse_bps < 0  = цена ушла за нас (хороший залив)
 
-═══ ЧТО СЧИТАТЬ УСПЕХОМ (зафиксировано заранее, 27.07.2026) ═══
-Мейкер стоит строить, если ОБА условия:
-  A. P(joint-fill в 300с) ≥ 50%   — обе ноги наливаются в разумном окне
-  B. средний adverse_bps < +2 bps — заливы не отравлены отбором
-Иначе мейкер вреден и таки надо остаться тейкером.
+═══ ИСТОРИЯ КРИТЕРИЕВ ═══
+
+v1 (задано 27.07, ПРОВАЛЕНО на n=471):
+  A. P(joint-fill в 300с) ≥ 50%     → 83%     ✅
+  B. средний adverse_bps < +2 bps   → +2.99   ❌
+Тест провален по букве. Но метрика B была специфицирована НЕВЕРНО: она
+усредняла ноги независимо, тогда как в delta-neutral паре ноги гасят adverse
+друг друга по построению (цена вверх → шорт в минусе, лонг в плюсе).
+Чистый adverse НА ПАРУ оказался −2.89 bps, то есть в нашу пользу.
+
+⚠️ Метрика изменена ПОСЛЕ того, как увиден результат. Это ровно тот приём,
+который весь проект даёт ложные находки (см. LOOPHOLE_SEARCH.md: правило
++$0.402 → −$1.42 после дедупликации). Поэтому v1 считается ПРОВАЛЕННОЙ,
+а исправленная метрика — НОВОЙ гипотезой со своим окном и своими критериями.
+
+Проверено и отвергнуто попутно: «adverse растёт с неликвидностью» — нет,
+>$100M даёт +0.55, $20-100M +5.11, $5-20M −1.45. Связи нет.
+
+═══ КРИТЕРИИ v2 (заданы 28.07 ДО сбора v2-данных) ═══
+Экономический порог: мейкер экономит (0.055−0.020)%×4 ноги = 14 bps.
+Значит полная ожидаемая стоимость мейкер-входа должна быть заметно ниже.
+
+  E[стоимость] = P(joint)·adverse_на_пару + P(partial)·min(догнать, развернуть)
+
+  1. n ≥ 200 валидных v2-групп
+  2. E[стоимость] < 7 bps          — половина экономии, запас на ошибку модели
+  3. P(partial)·стоимость_partial < 4 bps — голые ноги не съедают всё сами
+  4. adverse на пару < +7 bps      — сам по себе не должен съесть экономию
+
+Провал любого → мейкер не строим, остаёмся тейкером и закрываем вопрос.
 
 Run: python -m funding.maker_probe
 """
@@ -62,9 +87,12 @@ from shared.db import init_db, MakerFillProbe
 BY_WS = "wss://stream.bybit.com/v5/public/linear"
 BN_WS = "wss://fstream.binance.com/stream"
 
+PROBE_VERSION = 2
 PROBE_EVERY_S = 300        # новый замер каждые 5 мин
 FILL_WINDOW_S = 300        # сколько ждём залива
 ADVERSE_LAG_S = 30         # через сколько после залива смотрим mid
+PARTIAL_DECIDE_S = 60      # столько ждём вторую ногу, потом считаем разруливание
+TAKER_BPS = 5.5            # тейкер-комиссия одной ноги, bps
 N_SYMBOLS = 5              # сколько символов держать под замером
 REFRESH_SYMBOLS_S = 3600
 BASELINE = "ETHUSDT"       # эталон ликвидности, всегда в наборе
@@ -301,11 +329,15 @@ async def one_probe(engine, sym: str, turnover: float) -> None:
                 exchange=ex, symbol=sym, side=side, probe_group=group,
                 limit_price=px, mid_at_place=mid, book_width_pct=round(width, 5),
                 turnover24h=turnover, window_secs=FILL_WINDOW_S,
+                probe_version=PROBE_VERSION,
                 placed_at=datetime.now(timezone.utc))
             s.add(r); s.flush(); ids[(ex, side)] = r.id
         s.commit()
 
     fills: dict[tuple[str, str], float] = {}
+    # стоимость разруливания, если вторая нога не пришла за PARTIAL_DECIDE_S
+    resolution: dict[tuple[str, str], tuple[float, float]] = {}
+    first_fill_ts: float | None = None
     deadline = t0 + FILL_WINDOW_S
     while time.time() < deadline and len(fills) < len(legs):
         await asyncio.sleep(1)
@@ -315,9 +347,40 @@ async def one_probe(engine, sym: str, turnover: float) -> None:
             ts = _crossed(ex, sym, side, px, t0)
             if ts:
                 fills[(ex, side)] = ts
+                if first_fill_ts is None:
+                    first_fill_ts = time.time()
+
+        # одна нога висит дольше PARTIAL_DECIDE_S → фиксируем цену выхода
+        # из непарной позиции ПРЯМО СЕЙЧАС (это реальный момент решения)
+        if (first_fill_ts and len(fills) == 1 and not resolution
+                and time.time() - first_fill_ts >= PARTIAL_DECIDE_S):
+            (fex, fside) = next(iter(fills))
+            for ex, side, px, _, _ in legs:
+                bk = _books.get((ex, sym))
+                if not bk:
+                    continue
+                bid, ask = bk[0], bk[1]
+                if (ex, side) == (fex, fside):
+                    # развернуть залившуюся ногу тейкером
+                    if side == "sell@ask":      # мы продали → выкупаем по ask
+                        cost = (ask - px) / px * 10_000 + TAKER_BPS
+                    else:                        # мы купили → продаём по bid
+                        cost = (px - bid) / px * 10_000 + TAKER_BPS
+                    resolution[("unwind", ex)] = (cost, 0.0)
+                else:
+                    # догнать недостающую ногу тейкером
+                    if side == "sell@ask":      # надо продать → бьём в bid
+                        cost = (px - bid) / px * 10_000 + TAKER_BPS
+                    else:                        # надо купить → бьём в ask
+                        cost = (ask - px) / px * 10_000 + TAKER_BPS
+                    resolution[("chase", ex)] = (cost, 0.0)
 
     # adverse selection: mid через 30с после залива
     await asyncio.sleep(ADVERSE_LAG_S)
+
+    partial = len(fills) == 1
+    chase = next((c for (k, _), (c, _) in resolution.items() if k == "chase"), None)
+    unwind = next((c for (k, _), (c, _) in resolution.items() if k == "unwind"), None)
 
     with Session(engine) as s:
         for ex, side, px, mid0, _ in legs:
@@ -325,6 +388,10 @@ async def one_probe(engine, sym: str, turnover: float) -> None:
             ts = fills.get((ex, side))
             r.trades_seen = sum(1 for tt, _ in _trades[f"{ex}:{sym}"] if tt >= t0)
             r.resolved_at = datetime.now(timezone.utc)
+            if partial:
+                r.partial_leg = True
+                r.chase_cost_bps = round(chase, 2) if chase is not None else None
+                r.unwind_cost_bps = round(unwind, 2) if unwind is not None else None
             if ts:
                 m_now = _mid(ex, sym)
                 r.filled = True
@@ -408,78 +475,100 @@ async def prober(engine) -> None:
         await asyncio.sleep(PROBE_EVERY_S)
 
 
+MAKER_SAVING_BPS = (0.00055 - 0.00020) * 4 * 10_000   # 14 bps на цикл
+
+
 async def report(engine) -> None:
-    """Сводка против ЗАРАНЕЕ зафиксированных критериев A и B."""
+    """Сводка против критериев v2 (заданы ДО сбора v2-данных)."""
     while True:
         await asyncio.sleep(3600)
         try:
             with Session(engine) as s:
                 rows = s.execute(select(
                     MakerFillProbe.probe_group, MakerFillProbe.exchange,
-                    MakerFillProbe.symbol, MakerFillProbe.filled,
-                    MakerFillProbe.secs_to_fill, MakerFillProbe.adverse_bps,
-                    MakerFillProbe.book_width_pct, MakerFillProbe.trades_seen
-                ).where(MakerFillProbe.resolved_at.isnot(None))).all()
+                    MakerFillProbe.filled, MakerFillProbe.secs_to_fill,
+                    MakerFillProbe.adverse_bps, MakerFillProbe.trades_seen,
+                    MakerFillProbe.chase_cost_bps, MakerFillProbe.unwind_cost_bps
+                ).where(MakerFillProbe.resolved_at.isnot(None),
+                        MakerFillProbe.probe_version == PROBE_VERSION)).all()
             if len(rows) < 4:
                 continue
 
             groups = defaultdict(list)
-            for g, ex, sym, f, secs, adv, w, tr in rows:
-                groups[g].append({"ex": ex, "sym": sym, "f": bool(f),
-                                  "secs": secs, "adv": adv, "w": w,
-                                  "tr": tr or 0})
+            for g, ex, f, secs, adv, tr, ch, un in rows:
+                groups[g].append({"ex": ex, "f": bool(f), "secs": secs,
+                                  "adv": adv, "tr": tr or 0,
+                                  "chase": ch, "unwind": un})
             # ⚠️ Нога с нулевой лентой — это НЕ «не залилось», это НЕ ИЗМЕРЕНО.
-            # Так баг Binance @aggTrade дал бы вывод «мейкер не работает на
-            # Binance» вместо «канал данных пуст». Такие группы отбрасываем.
             complete = [v for v in groups.values()
                         if len(v) == 2 and all(x["tr"] > 0 for x in v)]
             no_tape = sum(1 for v in groups.values()
                           if len(v) == 2 and any(x["tr"] == 0 for x in v))
             if not complete:
-                logger.warning(f"нет валидных замеров "
-                               f"(отброшено без ленты: {no_tape})")
+                logger.warning(f"нет валидных v2-замеров (без ленты: {no_tape})")
                 continue
 
-            joint = sum(1 for v in complete if all(x["f"] for x in v))
-            partial = sum(1 for v in complete
-                          if any(x["f"] for x in v) and not all(x["f"] for x in v))
-            none_ = len(complete) - joint - partial
-            advs = [x["adv"] for v in complete for x in v
-                    if x["f"] and x["adv"] is not None]
+            n = len(complete)
+            joint = [v for v in complete if all(x["f"] for x in v)]
+            partial = [v for v in complete
+                       if any(x["f"] for x in v) and not all(x["f"] for x in v)]
+
+            # ГЛАВНОЕ: adverse СУММОЙ ПО ПАРЕ — ноги гасят друг друга
+            nets = [sum(x["adv"] for x in v)
+                    for v in joint
+                    if all(x["adv"] is not None for x in v)]
+            net_adv = statistics.mean(nets) if nets else 0.0
+
+            # стоимость разруливания непарного залива: берём дешёвейший путь
+            part_costs = []
+            for v in partial:
+                opts = [c for x in v for c in (x["chase"], x["unwind"])
+                        if c is not None]
+                if opts:
+                    part_costs.append(min(opts))
+            part_cost = statistics.mean(part_costs) if part_costs else 0.0
+
+            p_joint = len(joint) / n
+            p_part = len(partial) / n
+            e_cost = p_joint * net_adv + p_part * part_cost
+            part_drag = p_part * part_cost
+
+            c1 = n >= 200
+            c2 = e_cost < 7.0
+            c3 = part_drag < 4.0
+            c4 = net_adv < 7.0
+            passed = c1 and c2 and c3 and c4
+
             secs = [x["secs"] for v in complete for x in v
                     if x["f"] and x["secs"] is not None]
 
-            jr = joint / len(complete) * 100
-            mean_adv = statistics.mean(advs) if advs else 0.0
-            ok_a = jr >= 50
-            ok_b = mean_adv < 2.0
+            logger.info(f"[report v2] n={n} joint={p_joint*100:.0f}% "
+                        f"net_adv={net_adv:+.2f} part_cost={part_cost:.2f} "
+                        f"E={e_cost:+.2f}bps passed={passed}")
 
-            # по биржам отдельно
-            per_ex = defaultdict(lambda: [0, 0])
-            for v in complete:
-                for x in v:
-                    per_ex[x["ex"]][1] += 1
-                    if x["f"]:
-                        per_ex[x["ex"]][0] += 1
-
-            logger.info(f"[report] замеров={len(complete)} joint={jr:.0f}% "
-                        f"adverse={mean_adv:+.2f}bps A={ok_a} B={ok_b}")
-
-            msg = (f"🧪 MAKER PROBE (валидных замеров: {len(complete)}"
-                   + (f", отброшено без ленты: {no_tape}" if no_tape else "")
-                   + ")\n\n"
-                   f"Обе ноги залились: {joint} ({jr:.0f}%)\n"
-                   f"Только одна: {partial} | Ни одной: {none_}\n"
-                   f"Медиана времени залива: "
-                   f"{statistics.median(secs):.0f}с\n" if secs else "")
-            msg += (f"Adverse selection: {mean_adv:+.2f} bps\n\n"
-                    f"По биржам (fill-rate ноги):\n")
-            for ex, (f_, t_) in per_ex.items():
-                msg += f"  {ex}: {f_}/{t_} ({f_/t_*100:.0f}%)\n"
-            msg += (f"\nКритерии (заданы заранее):\n"
-                    f"{'✅' if ok_a else '❌'} A: joint-fill ≥50% ({jr:.0f}%)\n"
-                    f"{'✅' if ok_b else '❌'} B: adverse <+2bps ({mean_adv:+.2f})\n\n"
-                    f"{'→ мейкер стоит строить' if ok_a and ok_b else '→ мейкер вреден, остаёмся тейкером'}")
+            msg = (f"🧪 MAKER PROBE v2 (n={n}"
+                   + (f", без ленты отброшено: {no_tape}" if no_tape else "")
+                   + f")\n\n"
+                   f"Обе ноги: {len(joint)} ({p_joint*100:.0f}%) | "
+                   f"одна: {len(partial)} ({p_part*100:.0f}%)\n")
+            if secs:
+                msg += f"Медиана залива: {statistics.median(secs):.0f}с\n"
+            msg += (f"\nЭКОНОМИКА (экономия мейкера {MAKER_SAVING_BPS:.0f} bps):\n"
+                    f"  adverse на пару:  {net_adv:+.2f} bps\n"
+                    f"  разрулить одну:   {part_cost:+.2f} bps "
+                    f"(n={len(part_costs)})\n"
+                    f"  вклад непарных:   {part_drag:+.2f} bps\n"
+                    f"  E[стоимость]:     {e_cost:+.2f} bps\n"
+                    f"  ЧИСТО:            {MAKER_SAVING_BPS - e_cost:+.2f} bps\n"
+                    f"\nКритерии v2 (заданы до сбора):\n"
+                    f"{'✅' if c1 else '⬜'} 1. n≥200 ({n})\n"
+                    f"{'✅' if c2 else '❌'} 2. E[стоимость]<7 ({e_cost:+.2f})\n"
+                    f"{'✅' if c3 else '❌'} 3. вклад непарных<4 ({part_drag:+.2f})\n"
+                    f"{'✅' if c4 else '❌'} 4. adverse пары<7 ({net_adv:+.2f})\n\n"
+                    + ("→ мейкер выгоден, можно строить экзекьютор"
+                       if passed else
+                       ("→ рано, копим выборку" if not c1
+                        else "→ мейкер не окупается, остаёмся тейкером")))
 
             cfg = load_config()
             if cfg.telegram_token and cfg.telegram_chat_id:

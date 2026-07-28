@@ -341,6 +341,19 @@ class MakerFillProbe(Base):
     placed_at = Column(DateTime, default=utcnow)
     resolved_at = Column(DateTime)
 
+    # ── v2 (28.07): то, что v1 не измеряла ───────────────────────────────
+    # v1 провалилась по критерию B (+2.99 bps), НО метрика была неверной:
+    # усредняла ноги независимо, хотя в delta-neutral паре они гасят adverse
+    # друг друга. Чистый adverse на пару оказался −2.89 bps (в нашу пользу).
+    # Метрика сменена ПОСЛЕ результата → это новая гипотеза, а не спасение
+    # старой. v2 собирается заново, с критериями, заданными до сбора.
+    probe_version = Column(Integer, default=1)
+    # цена разруливания непарного залива (главное, что осталось неизвестным:
+    # 17% входов оставляли ГОЛУЮ ногу, стоимость этого не измерялась вообще)
+    partial_leg = Column(Boolean, default=False)   # эта нога осталась одна
+    chase_cost_bps = Column(Float)    # догнать недостающую ногу тейкером
+    unwind_cost_bps = Column(Float)   # развернуть залившуюся ногу тейкером
+
 
 class LiqEvent(Base):
     """Ликвидация с Bybit WS (allLiquidation) — для анализа каскадов/отскоков."""
@@ -376,6 +389,12 @@ def _migrate_arb_paper(engine) -> None:
         },
         "spread_positions": {
             "variant": "TEXT",
+        },
+        "maker_fill_probes": {
+            "probe_version": "INTEGER",
+            "partial_leg": "BOOLEAN",
+            "chase_cost_bps": "FLOAT",
+            "unwind_cost_bps": "FLOAT",
         },
     }
     with engine.begin() as conn:
