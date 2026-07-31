@@ -1,11 +1,11 @@
 # TraderBot
 
 Трёхмесячное исследование: существует ли устойчивый край в розничном
-крипто-алготрейдинге на публичных сигналах. **Проверено 10 гипотез, все закрыты
+крипто-алготрейдинге на публичных сигналах. **Проверено 11 гипотез, все закрыты
 количественно. Реальными деньгами не рискнули ни разу.**
 
 📖 **Начни отсюда:**
-- [`PROJECT_JOURNEY.md`](PROJECT_JOURNEY.md) — полная история: 24 фазы, 33 бага,
+- [`PROJECT_JOURNEY.md`](PROJECT_JOURNEY.md) — полная история: 25 фаз, 33 бага,
   31 урок, все цифры
 - [`LOOPHOLE_SEARCH.md`](LOOPHOLE_SEARCH.md) — поиск лазейки: репрайсинг журналов
   под непроверенные режимы исполнения
@@ -27,6 +27,7 @@ Buy&hold фандинга:     обвал ×30 out-of-sample                 ❌
 Перп-перп + мин.холд:  n=29, критерии 2/3/4 провалены          ❌
 Мейкер-исполнение:     n=2313, вклад непарных +5.00 (порог 4)   ❌
 Фандинг новых листингов: n=15, прибыльных 0/15                 ❌
+Поглощение ликвидаций: n=203, медиана −0.10 при среднем +0.22   ❌
 ```
 
 **Край всегда примерно равен комиссии.** Два независимых замера на своих журналах:
@@ -110,6 +111,7 @@ traderbot/
 │   ├── hold_validation.py    🔍 hold-модель на 2 мес settled-истории
 │   ├── carry_backtest.py     cross-sectional carry (вердикт: −$102)
 │   ├── listing_funding_analysis.py 🔍 фандинг новых листингов (0/15 прибыльных)
+│   ├── liq_absorption_analysis.py  🔍 поглощение ликвидаций лимиткой (провал)
 │   ├── funding_persistence.py  эпизодная модель, пороги из данных
 │   ├── liq_cascade_analysis.py  659 каскадов, опровержение отскока
 │   └── liq_impulse_analysis.py  sub-second, задержка входа
@@ -145,6 +147,7 @@ python scripts/loophole_analysis.py         # репрайсинг журнал�
 python scripts/hold_validation.py           # out-of-sample hold-модель
 python scripts/carry_backtest.py            # cross-sectional carry
 python scripts/listing_funding_analysis.py  # фандинг новых листингов
+python scripts/liq_absorption_analysis.py   # поглощение ликвидаций лимиткой
 ```
 
 ---
