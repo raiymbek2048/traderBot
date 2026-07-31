@@ -1,12 +1,12 @@
 # TraderBot
 
 Трёхмесячное исследование: существует ли устойчивый край в розничном
-крипто-алготрейдинге на публичных сигналах. **Проверено 9 гипотез, все закрыты
+крипто-алготрейдинге на публичных сигналах. **Проверено 10 гипотез, все закрыты
 количественно. Реальными деньгами не рискнули ни разу.**
 
 📖 **Начни отсюда:**
-- [`PROJECT_JOURNEY.md`](PROJECT_JOURNEY.md) — полная история: 19 фаз, 28 багов,
-  18 уроков, все цифры
+- [`PROJECT_JOURNEY.md`](PROJECT_JOURNEY.md) — полная история: 24 фазы, 33 бага,
+  31 урок, все цифры
 - [`LOOPHOLE_SEARCH.md`](LOOPHOLE_SEARCH.md) — поиск лазейки: репрайсинг журналов
   под непроверенные режимы исполнения
 - [`STRATEGY_NEXT.md`](STRATEGY_NEXT.md) — что делать дальше и почему
@@ -24,7 +24,9 @@ Liq-momentum:          36 сделок / −$0.74, режимно-зависим
 Momentum 5m:           0 сделок за 3 недели                    ❌
 Cross-sectional carry: фандинг +$110, basis −$175              ❌
 Buy&hold фандинга:     обвал ×30 out-of-sample                 ❌
-Перп-перп + мин.холд:  запущен 27.07, критерии заранее         🧪
+Перп-перп + мин.холд:  n=29, критерии 2/3/4 провалены          ❌
+Мейкер-исполнение:     n=2313, вклад непарных +5.00 (порог 4)   ❌
+Фандинг новых листингов: n=15, прибыльных 0/15                 ❌
 ```
 
 **Край всегда примерно равен комиссии.** Два независимых замера на своих журналах:
@@ -87,14 +89,15 @@ n=12 до n=29), фандинг реализуется на **~10%** от обе
 ```
 traderbot/
 ├── funding/
-│   ├── hold_paper.py    🧪 мин.холд до начисления (единственный активный тест)
+│   ├── hold_paper.py    ⛔ мин.холд до начисления (тест завершён, провален)
+│   ├── maker_probe.py   ⛔ замер исполнимости лимитников (завершён, провален)
 │   ├── executor.py         BybitClient, delta-neutral spot+perp, settled-accrual
 │   ├── monitor.py          скан всех перпов, анти-churn стрики
 │   ├── run.py              лончер funding
 │   ├── spread_scan.py      сканер спреда фандинга Bybit vs Binance
 │   └── spread_paper.py     ⛔ A/B-решётка 11 вариантов (закрыта, журнал испорчен)
 ├── alerts/
-│   └── public.py         📡 публичный канал алертов
+│   └── public.py         ⛔ публичный канал алертов (остановлен)
 ├── arbitrage/
 │   ├── liq_recorder.py     рекордер ликвидаций (heartbeat WS)
 │   ├── liq_momentum.py  ⛔ follow-momentum после каскадов (закрыт)
@@ -106,6 +109,7 @@ traderbot/
 │   ├── loophole_analysis.py  🔍 репрайсинг журналов под maker/hold
 │   ├── hold_validation.py    🔍 hold-модель на 2 мес settled-истории
 │   ├── carry_backtest.py     cross-sectional carry (вердикт: −$102)
+│   ├── listing_funding_analysis.py 🔍 фандинг новых листингов (0/15 прибыльных)
 │   ├── funding_persistence.py  эпизодная модель, пороги из данных
 │   ├── liq_cascade_analysis.py  659 каскадов, опровержение отскока
 │   └── liq_impulse_analysis.py  sub-second, задержка входа
@@ -116,9 +120,8 @@ traderbot/
 └── traderbot.db            SQLite
 ```
 
-⛔ = закрытая стратегия, код оставлен как история
-🔍 = аналитический скрипт
-🧪 = активный тест
+⛔ = закрытая гипотеза, код оставлен как история
+🔍 = аналитический скрипт (запускается на собранных данных)
 
 **Мёртвый код** (майские модули, не используются ни одним сервисом):
 `analyst/`, `bot/`, `executor/`, `risk_manager/`, `gate/`, `momentum/`.
@@ -131,21 +134,17 @@ traderbot/
 python -m venv .venv && source .venv/bin/activate
 pip install websockets loguru sqlalchemy python-dotenv numpy ccxt httpx
 
-# активный тест
-python -m funding.hold_paper
-
-# публичные алерты (нужен PUBLIC_CHANNEL_ID)
-python -m alerts.public
-
-# рекордер данных
-python -m arbitrage.liq_recorder
+# то, что работает сейчас
+python -m arbitrage.liq_recorder   # рекордер ликвидаций
+python -m funding.run              # скан фандинга, порог 0.20%
 ```
 
 ### Анализ на собранных данных
 ```bash
-python scripts/loophole_analysis.py   # репрайсинг журналов
-python scripts/hold_validation.py     # out-of-sample hold-модель
-python scripts/carry_backtest.py      # cross-sectional carry
+python scripts/loophole_analysis.py         # репрайсинг журналов под maker/hold
+python scripts/hold_validation.py           # out-of-sample hold-модель
+python scripts/carry_backtest.py            # cross-sectional carry
+python scripts/listing_funding_analysis.py  # фандинг новых листингов
 ```
 
 ---
@@ -174,12 +173,14 @@ HOLD_SIZE_USDT=50
 
 | Таблица | Описание |
 |---|---|
-| `hold_positions` | 🧪 Тест мин.холда. Чистая: один вариант, PnL в двух режимах комиссий |
+| `hold_positions` | Тест мин.холда, n=29. Чистая: один вариант, PnL в двух режимах комиссий |
 | `liq_events` | 84k+ ликвидаций Bybit, $286M |
 | `funding_spread_snaps` | 78k+ снимков спреда фандинга (топ-20 за цикл) |
 | `funding_positions` | Spot+perp позиции с basis/fees/settled-фандингом |
 | `spread_positions` | ⚠️ A/B-журнал перп-перп — **испорчен размножением ×2.5**, дедуплицировать перед выводами |
-| `maker_fill_probes` | 🧪 Исполнимость лимитников по реальной ленте (joint-fill, adverse selection) |
+| `maker_fill_probes` | Исполнимость лимитников по реальной ленте (n=2313) |
+| `liq_momentum_trades` | 36 сделок follow-momentum |
+| `arb_paper_trades` | Спот-арбитраж (realism v2: VWAP, fillable) |
 
 ### ⚠️ Известные ловушки в данных
 
@@ -192,14 +193,17 @@ HOLD_SIZE_USDT=50
 **2. `spread_positions` размножен A/B-решёткой ×2.5.** 11 вариантов торговали
 одну возможность параллельно. Дедуплицируй по `(symbol, opened_at ±30 мин)`,
 иначе одна удачная сделка считается 7 раз.
-| `liq_momentum_trades` | 36 сделок follow-momentum |
-| `arb_paper_trades` | Спот-арбитраж (realism v2: VWAP, fillable) |
+
+**3. `funding/history` у Bybit обрезает выборку.** `limit=200` отдаёт только
+последние записи — для листинга 3-месячной давности его первая неделя туда не
+попадает и выглядит как «нет истории» (так n=3 вместо 15). Передавай
+`startTime` **и** `endTime` — без второго Bybit отдаёт пусто.
 
 ---
 
 ## Ключевые уроки метода
 
-Полный список (18) в [`PROJECT_JOURNEY.md`](PROJECT_JOURNEY.md). Три самых дорогих:
+Полный список (31) в [`PROJECT_JOURNEY.md`](PROJECT_JOURNEY.md). Три самых дорогих:
 
 1. **Задержка искажает сами данные.** Медленный сервер (500-1100ms) «видел»
    спреды, которых не было — все `+$1731/день` были артефактом измерения.
