@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from loguru import logger
 
 # СКАН-РЕЖИМ: сканируем ВСЕ перпы Bybit, а не фиксированный список.
@@ -28,6 +28,18 @@ MAX_POSITIONS   = 5        # макс. одновременных позиций
 ENTRY_CONFIRM   = 10       # фандинг ≥ порога N проверок подряд (N минут)
 EXIT_CONFIRM    = 10       # ниже exit-порога N проверок подряд
 ENTRY_WINDOW_H  = 3.0      # входим только если до сеттлмента ≤ этого (часов)
+
+# ── ПРАВИЛО МИНИМАЛЬНОГО ХОЛДА (добавлено 02.08) ─────────────────────────────
+# Анти-churn выше отсекал вход на мелькании, но НЕ мешал выйти до начисления.
+# Замерено на перп-перп (баг №25): 107 из 146 сделок (73%) закрылись, не пережив
+# ни одного сеттлмента — заплатили комиссию и не получили выплату, за которой шли.
+# Здесь тот же баг проявился живьём: SCRTUSDT, холд 2.8ч, фандинг ровно 0.0000,
+# PnL −$0.3489.
+# Фикс провалидирован в hold_paper.py на n=29: дожитие до начисления 92-97%.
+MIN_SETTLEMENTS   = 1      # не выходим, пока не пережили начисление
+MAX_HOLD_HOURS    = 30.0   # предохранитель от вечной позиции
+EMERGENCY_RATE    = -0.0010  # если ставка ушла ниже (−0.10%/8ч) — мы ПЛАТИМ,
+                             # тогда минимальный холд не держим и выходим
 
 CHECK_INTERVAL     = 60       # секунд между проверками фандинга
 SPOT_REFRESH_SEC   = 3600     # как часто обновлять список спот-пар
@@ -104,9 +116,46 @@ async def _send_tg(msg: str) -> None:
         logger.warning(f"TG send failed: {e}")
 
 
-async def rate_monitor(open_positions: dict[str, int]) -> None:
+FUNDING_HOURS = (0, 8, 16)
+
+
+def _settlements_survived(opened: datetime, now: datetime) -> int:
+    """Сколько начислений позиция реально пережила."""
+    n = 0
+    t = opened.replace(minute=0, second=0, microsecond=0)
+    while t <= now:
+        if t.hour in FUNDING_HOURS and opened < t <= now:
+            n += 1
+        t += timedelta(hours=1)
+    return n
+
+
+def _hold_state(engine, pos_id: int) -> tuple[int, float] | None:
+    """(пережито начислений, часов в позиции) по данным БД."""
+    if engine is None:
+        return None
+    try:
+        from sqlalchemy.orm import Session
+        from shared.db import FundingPosition
+        with Session(engine) as s:
+            p = s.get(FundingPosition, pos_id)
+            if not p or not p.opened_at:
+                return None
+            opened = p.opened_at
+            if opened.tzinfo is None:      # SQLite отдаёт naive — форсим UTC
+                opened = opened.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        return (_settlements_survived(opened, now),
+                (now - opened).total_seconds() / 3600)
+    except Exception as e:
+        logger.warning(f"hold_state({pos_id}): {e}")
+        return None
+
+
+async def rate_monitor(open_positions: dict[str, int], engine=None) -> None:
     """
     open_positions: {symbol: position_db_id} — что сейчас открыто.
+    engine: нужен для проверки минимального холда (без него правило отключено).
     Пушит в signal_queue:
       {"action": "open",  "symbol": ..., "funding_rate": ...}
       {"action": "close", "symbol": ..., "position_id": ...}
@@ -153,16 +202,38 @@ async def rate_monitor(open_positions: dict[str, int]) -> None:
                         f"{' (окно входа)' if in_window else ''}\nТоп фандинга:\n" + "\n".join(top_lines))
 
             # ── ЗАКРЫТИЕ: фандинг устойчиво ниже exit-порога ──
+            # ⚠️ НО не раньше, чем пережили начисление (см. MIN_SETTLEMENTS).
             for sym in list(open_positions.keys()):
-                if _below_streak.get(sym, 0) >= EXIT_CONFIRM:
-                    fr = rates.get(sym, 0.0)
-                    pos_id = open_positions[sym]
-                    logger.info(f"EXIT signal: {sym} funding={fr*100:.4f}% (pos_id={pos_id})")
-                    await _send_tg(
-                        f"📉 Funding ЗАКРЫТИЕ\n{sym}: фандинг упал до {fr*100:.4f}%/8h\n→ закрываем"
-                    )
-                    if signal_queue:
-                        await signal_queue.put({"action": "close", "symbol": sym, "position_id": pos_id})
+                if _below_streak.get(sym, 0) < EXIT_CONFIRM:
+                    continue
+                fr = rates.get(sym, 0.0)
+                pos_id = open_positions[sym]
+
+                st = _hold_state(engine, pos_id)
+                reason = "фандинг ниже порога"
+                if st is not None:
+                    n_sett, hold_h = st
+                    if n_sett < MIN_SETTLEMENTS:
+                        if fr <= EMERGENCY_RATE:
+                            reason = f"АВАРИЯ: ставка {fr*100:.4f}% — платим"
+                        elif hold_h > MAX_HOLD_HOURS:
+                            reason = f"max_hold {hold_h:.1f}ч без начисления"
+                        else:
+                            # держим: выйти сейчас = заплатить комиссию за ничто
+                            logger.info(
+                                f"HOLD {sym}: фандинг {fr*100:.4f}% ниже порога, но "
+                                f"начислений {n_sett}, в позиции {hold_h:.1f}ч → ждём выплату")
+                            continue
+
+                logger.info(f"EXIT signal: {sym} funding={fr*100:.4f}% "
+                            f"(pos_id={pos_id}, {reason})")
+                await _send_tg(
+                    f"📉 Funding ЗАКРЫТИЕ\n{sym}: фандинг {fr*100:.4f}%/8h\n"
+                    f"Причина: {reason}"
+                )
+                if signal_queue:
+                    await signal_queue.put({"action": "close", "symbol": sym,
+                                            "position_id": pos_id})
 
             # ── ОТКРЫТИЕ: топ-кандидаты, пока не упёрлись в MAX_POSITIONS ──
             # slots — свободные места в этом цикле; executor заполнит open_positions

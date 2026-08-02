@@ -362,6 +362,8 @@ async def close_position(
             qty = pos.spot_qty
             spot_entry = pos.spot_entry_price
             perp_entry = pos.perp_entry_price or spot_entry
+            opened_at = pos.opened_at
+            size_usdt = pos.size_usdt
 
         # Честные цены выхода (taker): спот продаём по bid, перп выкупаем по ask
         spot_t = bybit.get_ticker(symbol, "spot")
@@ -383,6 +385,25 @@ async def close_position(
             if perp_res.get("retCode") != 0:
                 raise RuntimeError(f"Perp close failed: {perp_res}")
 
+        # ⚠️ ПРИНУДИТЕЛЬНЫЙ ПЕРЕСЧЁТ ФАНДИНГА ПЕРЕД PnL (баг #34, найден 02.08).
+        # accrual_loop идёт раз в 30 мин. Если позиция закрывается вскоре после
+        # начисления, collected ещё нулевой, и PnL считается по устаревшему
+        # значению. Живой случай: SCRTUSDT пересекла сеттлмент 08:00, закрылась
+        # в 08:09 (+9 мин) → записан фандинг 0.000000 и PnL −$0.3489, хотя
+        # выплата была. Тянем settled-историю синхронно здесь.
+        final_collected = None
+        try:
+            if opened_at is not None:
+                opened_ms = int(opened_at.replace(tzinfo=timezone.utc).timestamp() * 1000)
+                settles = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: bybit.get_settled_fundings(symbol, opened_ms))
+                final_collected = round((size_usdt or 0.0)
+                                        * sum(r for _, r in settles), 6)
+                logger.info(f"[close] {symbol}: пересчёт фандинга по {len(settles)} "
+                            f"сеттлментам → {final_collected:+.6f}")
+        except Exception as e:
+            logger.warning(f"[close] пересчёт фандинга {symbol} не удался: {e}")
+
         # ПОЛНЫЙ PnL = ноги (basis) + собранный фандинг − комиссии (per-symbol)
         # spot leg:  qty × (exit − entry);  perp short leg:  qty × (entry − exit)
         spot_leg = qty * (spot_exit - spot_entry)
@@ -395,6 +416,9 @@ async def close_position(
             pos.spot_exit_price = spot_exit
             pos.perp_exit_price = perp_exit
             pos.funding_rate_close = 0.0
+            # берём пересчитанное, если получилось; иначе — что успел accrual
+            if final_collected is not None:
+                pos.funding_collected_usdt = final_collected
             pos.basis_pnl_usdt = basis_pnl
             pos.fees_usdt = fees
             pos.pnl_usdt = round(basis_pnl + (pos.funding_collected_usdt or 0.0) - fees, 4)

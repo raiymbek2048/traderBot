@@ -56,7 +56,7 @@ async def main() -> None:
     )
 
     await asyncio.gather(
-        monitor.rate_monitor(open_positions),
+        monitor.rate_monitor(open_positions, engine),
         monitor.stats_printer(open_positions),
         executor.run(engine, bybit, paper, size_usdt, open_positions),
         executor.accrual_loop(engine, open_positions, bybit),
