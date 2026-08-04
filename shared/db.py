@@ -355,6 +355,81 @@ class MakerFillProbe(Base):
     unwind_cost_bps = Column(Float)   # развернуть залившуюся ногу тейкером
 
 
+class VenueFundingSnap(Base):
+    """Снимок ставки фандинга и цены по площадке (RISEx / Bybit).
+
+    Нужен для замера ДИФФЕРЕНЦИАЛА в реальном времени. Историческая проверка
+    (scripts/risex_funding_diff.py) дала: дифференциал положителен почти на всех
+    символах (+2…+10%/год), но устойчивость знака 52-87%. Формально критерии не
+    прошли (1 символ из 3 требуемых — HYPE). Живой замер проверяет, держится ли
+    79% устойчивости HYPE на свежих данных.
+    """
+    __tablename__ = "venue_funding_snaps"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    venue = Column(String(12), nullable=False)      # risex | bybit
+    symbol = Column(String(24), nullable=False)     # базовый тикер: HYPE, XRP...
+    funding_rate = Column(Float)                    # за интервал площадки
+    interval_h = Column(Float)                      # длина интервала, часов
+    rate_daily_pct = Column(Float)                  # нормализовано в %/день
+    mark_price = Column(Float)
+    open_interest_usd = Column(Float)
+    next_funding_ms = Column(Float)
+    ts = Column(DateTime, nullable=False)
+
+
+class VenueFundingSettled(Base):
+    """ФАКТИЧЕСКИ начисленная ставка (не предсказанная).
+
+    Урок №4 и гипотеза 13: предсказанное ≠ полученное. NVDL показывал 0.4255%,
+    начислялось 0.0000%. Поэтому accrual считаем только по этой таблице.
+    Уникальность (venue, symbol, settle_ms) держит идемпотентность.
+    """
+    __tablename__ = "venue_funding_settled"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    venue = Column(String(12), nullable=False)
+    symbol = Column(String(24), nullable=False)
+    funding_rate = Column(Float, nullable=False)
+    settle_ms = Column(Float, nullable=False)
+    index_price = Column(Float)
+    recorded_at = Column(DateTime, default=utcnow)
+
+
+class RisexPaperPosition(Base):
+    """PAPER delta-neutral позиция RISEx ↔ Bybit — носитель для поинтов Ignite.
+
+    Конструкция: одна нога на RISEx, противоположная на Bybit, один актив.
+    Доход = дифференциал фандинга. Поинты Ignite начисляются за open interest ×
+    время, поэтому churn не нужен — позиция просто держится.
+
+    Комиссии моделируются по ФАКТИЧЕСКИМ ставкам (проверены через API 3 авг):
+      RISEx Tier 1: taker 3.0 bps / maker 1.0 bps (газ спонсируется)
+      Bybit:        taker 10.0 bps / maker 3.6 bps
+    """
+    __tablename__ = "risex_paper_positions"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    symbol = Column(String(24), nullable=False)
+    direction = Column(String(24), nullable=False)   # short_risex | long_risex
+    size_usdt = Column(Float, nullable=False)        # нотионал одной ноги
+    risex_entry_price = Column(Float)
+    bybit_entry_price = Column(Float)
+    risex_exit_price = Column(Float)
+    bybit_exit_price = Column(Float)
+    entry_diff_daily_pct = Column(Float)             # дифференциал на входе
+    funding_risex_usdt = Column(Float, default=0.0)  # начислено по ноге RISEx
+    funding_bybit_usdt = Column(Float, default=0.0)  # начислено по ноге Bybit
+    funding_net_usdt = Column(Float, default=0.0)    # сумма по обеим ногам
+    basis_pnl_usdt = Column(Float)                   # расхождение цен площадок
+    fees_taker_usdt = Column(Float)
+    fees_maker_usdt = Column(Float)
+    pnl_taker_usdt = Column(Float)
+    pnl_maker_usdt = Column(Float)
+    days_held = Column(Float)
+    status = Column(String(16), default="open")
+    paper = Column(Boolean, default=True)
+    opened_at = Column(DateTime, default=utcnow)
+    closed_at = Column(DateTime)
+
+
 class LiqEvent(Base):
     """Ликвидация с Bybit WS (allLiquidation) — для анализа каскадов/отскоков."""
     __tablename__ = "liq_events"
