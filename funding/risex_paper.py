@@ -225,7 +225,14 @@ def fetch_risex_settled(base: str, since_ms: int):
     out = []
     for r in recs:
         try:
-            out.append((int(r["start_time"]) / 1e6, float(r["funding_rate"]),
+            # ⚠️ Метка сеттлмента — end_time, НЕ start_time.
+            # Запись start_time=14:00 это выплата за период 14:00→15:00, которая
+            # начисляется в 15:00. Фандинг получает тот, кто держит позицию В
+            # МОМЕНТ начисления. Использование start_time отбрасывало выплату,
+            # полученную позицией, открытой в 14:05 — она сравнивалась как
+            # «14:00 < 14:05, значит до входа». Найдено на живых данных 4 авг.
+            settle_ms = int(r.get("end_time") or r["start_time"]) / 1e6
+            out.append((settle_ms, float(r["funding_rate"]),
                         float(r.get("index_price") or 0)))
         except (KeyError, ValueError):
             continue
